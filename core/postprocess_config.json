@@ -1,0 +1,19 @@
+{
+  "_comment": "Edit these lists to tune VivoType's transcript cleanup. 'fillers' are removed as whole words (case-insensitive). 'replacements' map a spoken/misrecognized term to its correct form. Currency conversion ($->INR) is handled in code, not here.",
+  "fillers": [
+    "um",
+    "uh",
+    "umm",
+    "uhh",
+    "er",
+    "erm"
+  ],
+  "replacements": {
+    "blr": "Bengaluru",
+    "bangalore": "Bengaluru",
+    "100k": "1 lakh",
+    "shrivastava": "Srivastava",
+    "iit": "IIT",
+    "upi": "UPI"
+  }
+}

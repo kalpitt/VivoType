@@ -1,0 +1,39 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Audio files (keep test fixtures)
+*.wav
+!tests/fixtures/*.wav
+!core/tests/fixtures/*.wav
+
+# macOS system files
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Model caches
+*.bin
+models/
+
+# Compiled macOS helper
+clients/mac/build/
+
+# Personalization data (keep folder layout, not personal recordings)
+core/data/labels.csv
+
+# Personal names lexicon (private — contacts)
+core/data/lexicon/
+
+# Captured corrections (private)
+core/data/corrections.jsonl
+
+# Per-user settings (defaults live in core/config.py)
+core/config.json
+
+# Personal dictionary overlay (promotions land here; not for the public repo)
+core/data/user_dictionary.json

@@ -1,0 +1,5 @@
+# Scratch/exploration artifacts — keep only the reproducible generator scripts.
+*
+!.gitignore
+!make_brand.swift
+!make_menubar_icon.swift

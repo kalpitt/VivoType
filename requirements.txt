@@ -1,0 +1,4 @@
+# VivoType core (ASR backend) dependencies — install inside a local .venv.
+mlx-whisper>=0.4.0      # local Whisper transcription on Apple Silicon (MLX GPU/ANE backend)
+numpy>=1.24             # array handling (also pulled in by mlx-whisper)
+sounddevice>=0.4.6      # microphone capture for the personalization recorder (Phase 4)

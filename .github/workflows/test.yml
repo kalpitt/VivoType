@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']   # every branch, so feature-branch pushes run CI too
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel an in-progress run when a newer commit is pushed to the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    name: Python tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the minimum the core/ source supports; 3.11 is the minimum the
+        # runtime venv requires (setup_core.sh); 3.13 guards against regressions
+        # on the newest interpreters.
+        python-version: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        # NOTE: we deliberately do NOT install -r requirements.txt here. The ASR
+        # backend now uses mlx-whisper (Apple Silicon / mlx-metal only), which has
+        # no Linux wheel. The stdlib-unittest suite never imports it — transcription
+        # is always mocked and mlx/huggingface imports are lazy — so numpy is the
+        # only third-party dependency the tests actually need.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "numpy>=1.24"
+
+      - name: Run core tests
+        run: python -m unittest discover -s core/tests -t . -v
+
+  swift-build:
+    name: macOS build (Swift)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Xcode CLI tools
+        run: swiftc --version
+
+      - name: Build VivoType.app
+        # Run the real packaging script so CI catches Swift syntax/API
+        # regressions across all modules AND build-script regressions. The
+        # script compiles every clients/mac/*.swift file as one module (no Xcode
+        # project — see ADR-0005) and ad-hoc signs the bundle.
+        run: ./clients/mac/build_app.sh
+
+      - name: Verify the app binary was produced
+        run: test -x clients/mac/build/VivoType.app/Contents/MacOS/VivoType
