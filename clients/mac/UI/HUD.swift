@@ -18,7 +18,7 @@ final class NonActivatingPanel: NSPanel {
 /// A row of bars whose heights track the live input level (a small "waveform").
 final class MeterView: NSView {
     var level: CGFloat = 0 { didSet { needsDisplay = true } }
-    var accent: NSColor = .systemRed { didSet { needsDisplay = true } }
+    var accent: NSColor = .systemGreen { didSet { needsDisplay = true } }
     private let bars = 13
 
     override func draw(_ dirtyRect: NSRect) {
@@ -102,8 +102,8 @@ final class RecordingPill {
         panel.contentView = blur
     }
 
-    /// Switch between push-to-talk ("Listening…", red) and the continuous
-    /// hands-free badge ("Hands-free", brand purple). Call before show().
+    /// Switch between push-to-talk ("Listening…", green) and the continuous
+    /// hands-free badge ("Hands-free", red). Call before show().
     func setMode(handsFree: Bool) {
         label.stringValue = handsFree ? "Hands-free" : "Listening…"
         let accent = handsFree ? handsFreeAccent : holdAccent

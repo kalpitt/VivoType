@@ -21,7 +21,9 @@ err() { echo "${red}Error:${reset} $*" >&2; exit 1; }
 
 [[ "$(uname)" == "Darwin" ]] || err "VivoType only runs on macOS."
 
-[[ "$(uname -m)" == "arm64" ]] || \
+# sysctl is Rosetta-transparent: returns 1 on Apple Silicon even when the
+# terminal is running under Rosetta 2 (where uname -m reports x86_64).
+[[ "$(sysctl -n hw.optional.arm64 2>/dev/null)" == "1" ]] || \
   err "VivoType requires an Apple Silicon Mac (M1/M2/M3/M4). Intel Macs are not supported."
 
 if ! command -v curl >/dev/null 2>&1; then
@@ -44,7 +46,19 @@ say "Downloading $APP_NAME $VERSION…"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Extract expected SHA256 from the API response (strip the "sha256:" prefix).
+EXPECTED_SHA=$(echo "$API_RESPONSE" | grep -o '"digest":"sha256:[^"]*"' | head -1 | sed 's/.*sha256://' | tr -d '"')
+
 curl -fsSL --progress-bar "$DOWNLOAD_URL" -o "$TMP/VivoType.zip"
+
+# Verify integrity — skipped only if GitHub didn't return a digest (shouldn't happen).
+if [[ -n "$EXPECTED_SHA" ]]; then
+  ACTUAL_SHA=$(shasum -a 256 "$TMP/VivoType.zip" | awk '{print $1}')
+  if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+    err "Integrity check failed — the download may be corrupted. Please try again."
+  fi
+fi
+
 unzip -q "$TMP/VivoType.zip" -d "$TMP"
 
 [[ -d "$TMP/$APP_NAME.app" ]] || \
