@@ -85,7 +85,7 @@ jobs:
             **SHA-256** (for the zip): `${{ env.SHA256 }}`
 
       - name: Update Homebrew cask
-        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        if: secrets.HOMEBREW_TAP_TOKEN != ''
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
