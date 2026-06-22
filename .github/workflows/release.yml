@@ -85,13 +85,12 @@ jobs:
             **SHA-256** (for the zip): `${{ env.SHA256 }}`
 
       - name: Update Homebrew cask
-        if: secrets.HOMEBREW_TAP_TOKEN != ''
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          # gh repo clone uses GH_TOKEN for auth; setup-git wires it for git push too.
           gh repo clone kalpitt/homebrew-vivotype tap
           gh auth setup-git
           sed -i '' \
