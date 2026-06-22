@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write            # needed to create GitHub Releases and upload assets
+
 jobs:
   build:
     name: Build & publish release
