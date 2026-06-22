@@ -91,7 +91,9 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/kalpitt/homebrew-vivotype.git" tap
+          # Use insteadOf so the token never needs to be URL-encoded.
+          git config --global "url.https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/.insteadOf" "https://github.com/"
+          git clone https://github.com/kalpitt/homebrew-vivotype.git tap
           sed -i '' \
             -e "s|version \".*\"|version \"${VERSION#v}\"|" \
             -e "s|sha256 \".*\"|sha256 \"${SHA256}\"|" \
