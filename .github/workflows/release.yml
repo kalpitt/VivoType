@@ -85,15 +85,15 @@ jobs:
             **SHA-256** (for the zip): `${{ env.SHA256 }}`
 
       - name: Update Homebrew cask
-        if: env.HOMEBREW_TAP_TOKEN != ''
+        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
         env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          # Use insteadOf so the token never needs to be URL-encoded.
-          git config --global "url.https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/.insteadOf" "https://github.com/"
-          git clone https://github.com/kalpitt/homebrew-vivotype.git tap
+          # gh repo clone uses GH_TOKEN for auth; setup-git wires it for git push too.
+          gh repo clone kalpitt/homebrew-vivotype tap
+          gh auth setup-git
           sed -i '' \
             -e "s|version \".*\"|version \"${VERSION#v}\"|" \
             -e "s|sha256 \".*\"|sha256 \"${SHA256}\"|" \
