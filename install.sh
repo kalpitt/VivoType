@@ -47,7 +47,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 # Extract expected SHA256 from the API response (strip the "sha256:" prefix).
-EXPECTED_SHA=$(echo "$API_RESPONSE" | grep -o '"digest":"sha256:[^"]*"' | head -1 | sed 's/.*sha256://' | tr -d '"')
+EXPECTED_SHA=$(echo "$API_RESPONSE" | grep -o '"digest": *"sha256:[^"]*"' | head -1 | sed 's/.*sha256://' | tr -d '"')
 
 curl -fsSL --progress-bar "$DOWNLOAD_URL" -o "$TMP/VivoType.zip"
 

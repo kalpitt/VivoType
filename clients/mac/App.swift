@@ -237,6 +237,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        handsFreeMaxTimer?.invalidate()
+        handsFreeMaxTimer = nil
         daemonClient?.shutdown()
     }
 
@@ -731,7 +733,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the hands-free badge; revert if capture didn't actually begin.
         isHandsFree = true
         dictation?.startRecording()
-        guard dictation?.isCapturing == true else { isHandsFree = false; return }
+        guard dictation?.isCapturing == true else { isHandsFree = false; setState(.idle); return }
         currentStatus = "Hands-free…"        // overrides the .recording label below
         handsFreeMaxTimer?.invalidate()
         handsFreeMaxTimer = Timer.scheduledTimer(withTimeInterval: handsFreeMaxDuration,
