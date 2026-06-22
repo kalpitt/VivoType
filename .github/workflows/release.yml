@@ -39,6 +39,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ZIP_PATH }}
+          draft: false
+          prerelease: false
           body: |
             ## Install VivoType ${{ env.VERSION }}
 
@@ -85,10 +87,13 @@ jobs:
             **SHA-256** (for the zip): `${{ env.SHA256 }}`
 
       - name: Update Homebrew cask
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN not set — skipping cask update"
+            exit 0
+          fi
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           gh repo clone kalpitt/homebrew-vivotype tap
