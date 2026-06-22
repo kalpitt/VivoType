@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build & publish release
+    runs-on: macos-15        # Apple Silicon runner — required for mlx-whisper at runtime
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build VivoType.app
+        run: bash clients/mac/build_app.sh
+        # VIVOTYPE_SIGN_ID is intentionally unset — CI produces an ad-hoc signed
+        # build. The install.sh and Homebrew cask both strip the quarantine flag
+        # so users never see a security warning.
+
+      - name: Create release zip
+        run: |
+          VERSION="${{ github.ref_name }}"
+          cd clients/mac/build
+          # Zip with ditto to preserve macOS extended attributes correctly.
+          ditto -c -k --sequesterRsrc --keepParent VivoType.app \
+            "VivoType-${VERSION}.zip"
+          echo "ZIP_PATH=clients/mac/build/VivoType-${VERSION}.zip" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          # Compute SHA256 for the Homebrew cask.
+          SHA=$(shasum -a 256 "VivoType-${VERSION}.zip" | awk '{print $1}')
+          echo "SHA256=${SHA}" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_PATH }}
+          body: |
+            ## Install VivoType ${{ env.VERSION }}
+
+            VivoType is a fully local macOS dictation app — everything runs on your Mac, nothing leaves your device.
+
+            **Requires an Apple Silicon Mac (M1 / M2 / M3 / M4) running macOS 13 or later.**
+
+            ---
+
+            ### Option 1 — Paste this in Terminal (recommended)
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/kalpitt/VivoType/main/install.sh | bash
+            ```
+
+            Opens without any security warning. Done in under a minute.
+
+            ---
+
+            ### Option 2 — Homebrew
+
+            ```bash
+            brew tap kalpitt/vivotype
+            brew install --cask vivotype
+            ```
+
+            ---
+
+            ### Option 3 — Manual download
+
+            1. Download **VivoType-${{ env.VERSION }}.zip** below
+            2. Unzip it — you'll get `VivoType.app`
+            3. Drag `VivoType.app` to your **Applications** folder
+            4. The first time you open it, **right-click → Open** (macOS will ask you to confirm once — this is normal for apps not sold through the App Store)
+
+            ---
+
+            ### First launch
+
+            VivoType will guide you through a short setup on first launch. It downloads a small speech model (~150 MB) once and keeps everything on your device after that.
+
+            ---
+
+            **SHA-256** (for the zip): `${{ env.SHA256 }}`
+
+      - name: Update Homebrew cask
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/kalpitt/homebrew-vivotype.git" tap
+          sed -i '' \
+            -e "s|version \".*\"|version \"${VERSION#v}\"|" \
+            -e "s|sha256 \".*\"|sha256 \"${SHA256}\"|" \
+            tap/Casks/vivotype.rb
+          cd tap
+          git add Casks/vivotype.rb
+          git diff --cached --quiet || git commit -m "chore: update cask to ${VERSION}"
+          git push
