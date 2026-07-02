@@ -114,10 +114,19 @@ def _transcribe(model, wav_path: str, initial_prompt: str, raw: bool,
 
 
 def main() -> None:
-    settings = load_settings()
-    model_name: str = settings.get("model", "small.en")
-    pp_config = load_config()
-    pp_mtime = config_mtime()  # baseline for live dictionary/filler reloads
+    try:
+        settings = load_settings()
+        model_name: str = settings.get("model", "small.en")
+        pp_config = load_config()
+        pp_mtime = config_mtime()  # baseline for live dictionary/filler reloads
+    except Exception as exc:
+        # A corrupt config.json / postprocess config must not kill the daemon
+        # with a bare traceback on stderr — emit a proper NDJSON error so the
+        # Swift client sees *why* and falls back to the CLI, instead of just
+        # "daemon terminated" with no cause (stderr is captured to daemon.log,
+        # but the app shouldn't need to go spelunking for a config typo).
+        _emit({"status": "error", "error": f"startup: {exc}"})
+        sys.exit(1)
 
     _emit({"status": "loading"})
 
@@ -163,6 +172,7 @@ def main() -> None:
                 model = new
                 model_name = new_model
                 gc.collect()  # reclaim the now-unreferenced old model
+                asr.clear_gpu_cache()  # return its Metal buffers to the OS
                 pp_config = load_config()
                 pp_mtime = config_mtime()
                 _emit({"status": "ready", "model": model_name})

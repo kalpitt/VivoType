@@ -15,6 +15,7 @@ so the read-only ``.app`` bundle is never written to (see ADR-0003).
 """
 from __future__ import annotations
 
+import concurrent.futures
 import os
 
 try:  # sibling module; works whether imported as a package or a loose script
@@ -36,6 +37,23 @@ _REPO_TEMPLATE = "mlx-community/whisper-{name}-mlx"
 def repo_for(model_name: str) -> str:
     """Map a Whisper size (e.g. ``small.en``) to its mlx-community HF repo id."""
     return _REPO_TEMPLATE.format(name=model_name)
+
+
+def clear_gpu_cache() -> None:
+    """Release MLX's cached-but-unused Metal GPU buffers back to the OS.
+
+    mlx-whisper's ModelHolder (see MLXModel.__init__) replaces its one cached
+    model in place when a different repo is requested, so the old weights are
+    already unreferenced by the time a reload finishes — but MLX's own
+    allocator keeps freed GPU buffers around for reuse rather than returning
+    them immediately. Without this, switching models repeatedly (Settings ->
+    Model submenu) grows resident GPU memory monotonically.
+    """
+    try:
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        pass  # best-effort; older/newer mlx releases may not expose this
 
 
 def is_model_cached(model_name: str) -> bool:
@@ -101,11 +119,20 @@ class MLXModel:
         try:
             import mlx.core as mx
             from mlx_whisper.transcribe import ModelHolder
-            ModelHolder.get_model(self.repo, mx.float16)
         except Exception:
-            # Unexpected mlx-whisper internals — fall back to lazy loading on
-            # the first transcribe() call (correct, just not pre-warmed).
-            pass
+            # mlx-whisper internals moved — fall back to lazy loading on the
+            # first transcribe() call (correct, just not pre-warmed).
+            return
+        try:
+            ModelHolder.get_model(self.repo, mx.float16)
+        except Exception as exc:
+            # A real load failure (no network on first run, partial/corrupt
+            # download, unknown model) must propagate so the daemon emits an
+            # NDJSON `error` event instead of a false `ready` — otherwise the
+            # app advances to Success and every dictation silently fails.
+            raise RuntimeError(
+                f"failed to load Whisper model '{model_name}' ({self.repo}): {exc}"
+            ) from exc
 
     def transcribe(self, audio, *, initial_prompt: str | None = None, **_ignored):
         """Transcribe a 16 kHz mono float32 array.
@@ -140,6 +167,31 @@ class MLXModel:
         return segments, result
 
 
-def load_model(model_name: str) -> MLXModel:
-    """Build (and warm) an MLX Whisper model for the given Whisper size."""
-    return MLXModel(model_name)
+# A stalled connection during the one-time model download (~466 MB for
+# small.en) must not hang the daemon forever with "Downloading model…" spinning
+# with no way out. Bounds the whole load+warm-up by wall-clock time.
+MODEL_LOAD_TIMEOUT = 180  # seconds
+
+
+def load_model(model_name: str, timeout: float = MODEL_LOAD_TIMEOUT) -> MLXModel:
+    """Build (and warm) an MLX Whisper model for the given Whisper size.
+
+    Runs the load on a worker thread so a stalled download can be bounded by
+    `timeout` instead of hanging the caller indefinitely. The load itself
+    (native HTTP + Metal calls) isn't cooperatively interruptible, so on
+    timeout this abandons the wait and raises — the background thread may
+    keep running until its own socket-level timeout fires, but the daemon can
+    immediately report the failure and move on (see core/daemon.py's error
+    path) instead of blocking the whole process.
+    """
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(MLXModel, model_name)
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        raise TimeoutError(
+            f"loading model '{model_name}' timed out after {int(timeout)}s "
+            "(stalled download or network issue)"
+        ) from None
+    finally:
+        pool.shutdown(wait=False)  # don't block on a still-running load

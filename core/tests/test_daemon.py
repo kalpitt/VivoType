@@ -107,6 +107,55 @@ class BootTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Pre-protocol startup failures (F8)
+# ---------------------------------------------------------------------------
+
+class PreProtocolCrashTests(unittest.TestCase):
+    """A crash before the boot sequence even starts (corrupt config.json or
+    postprocess config) must surface as an NDJSON error, not a bare traceback
+    the Swift client can't see (stdout carries no bytes; stderr is discarded
+    pre-fix / logged post-fix, but either way the app just sees "terminated")."""
+
+    def test_corrupt_settings_emits_error_and_exits(self):
+        out_buf = io.StringIO()
+        with mock.patch("core.daemon.load_settings", side_effect=ValueError("bad json")), \
+             mock.patch("sys.stdin", io.StringIO("")), \
+             mock.patch("sys.stdout", out_buf), \
+             self.assertRaises(SystemExit) as ctx:
+            daemon.main()
+        self.assertEqual(ctx.exception.code, 1)
+
+        msgs = [json.loads(l) for l in out_buf.getvalue().splitlines() if l.strip()]
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["status"], "error")
+        self.assertIn("bad json", msgs[0]["error"])
+
+    def test_corrupt_postprocess_config_emits_error_and_exits(self):
+        out_buf = io.StringIO()
+        with mock.patch("core.daemon.load_config", side_effect=ValueError("bad pp config")), \
+             mock.patch("sys.stdin", io.StringIO("")), \
+             mock.patch("sys.stdout", out_buf), \
+             self.assertRaises(SystemExit):
+            daemon.main()
+
+        msgs = [json.loads(l) for l in out_buf.getvalue().splitlines() if l.strip()]
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["status"], "error")
+        self.assertIn("bad pp config", msgs[0]["error"])
+
+    def test_no_model_load_attempted_after_startup_crash(self):
+        # A startup crash must exit before ever touching the (possibly slow /
+        # network-bound) model loader.
+        with mock.patch("core.daemon.load_settings", side_effect=ValueError("boom")), \
+             mock.patch("core.daemon._load_model") as load_mock, \
+             mock.patch("sys.stdin", io.StringIO("")), \
+             mock.patch("sys.stdout", io.StringIO()), \
+             self.assertRaises(SystemExit):
+            daemon.main()
+        load_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Transcription requests
 # ---------------------------------------------------------------------------
 
@@ -364,6 +413,123 @@ class TranscribeUnitTests(unittest.TestCase):
             _make_wav(Path(wav))
             result = daemon._transcribe(model, wav, "VivoType", False, self._pp())
         self.assertEqual(result["text"], "")
+
+
+class ModelLoadFailureIntegrationTests(unittest.TestCase):
+    """F1 end-to-end: daemon.main() through the REAL core.asr loader (only the
+    mlx modules are faked). A warm-up failure must surface as an NDJSON `error`
+    event — never a false `ready` — and a failed reload must still roll back."""
+
+    def test_boot_load_failure_emits_error_and_exits(self):
+        from core.tests.test_asr import _fake_mlx_modules
+
+        def boom(repo, dtype):
+            raise OSError("download failed")
+
+        out_buf = io.StringIO()
+        with mock.patch.dict(sys.modules, _fake_mlx_modules(boom)), \
+             mock.patch("core.daemon._is_model_cached", return_value=True), \
+             mock.patch("sys.stdin", io.StringIO("")), \
+             mock.patch("sys.stdout", out_buf), \
+             self.assertRaises(SystemExit):
+            daemon.main()
+
+        msgs = [json.loads(l) for l in out_buf.getvalue().splitlines() if l.strip()]
+        statuses = [m.get("status") for m in msgs]
+        self.assertIn("error", statuses)
+        self.assertNotIn("ready", statuses)  # the F1 lie: ready after a failed load
+        err = next(m for m in msgs if m.get("status") == "error")
+        self.assertIn("download failed", err["error"])
+
+    def test_failed_reload_via_real_loader_rolls_back_and_serves(self):
+        from core.tests.test_asr import _fake_mlx_modules
+
+        def selective(repo, dtype):
+            if "broken" in repo:
+                raise OSError("bad model")
+
+        def fake_transcribe(audio, **opts):
+            return {"segments": [{"start": 0.0, "end": 1.0, "text": " still works",
+                                  "avg_logprob": -0.2, "no_speech_prob": 0.0}]}
+
+        with tempfile.TemporaryDirectory() as d:
+            wav = Path(d) / "t.wav"
+            _make_wav(wav)
+            out_buf = io.StringIO()
+            stdin = io.StringIO(
+                json.dumps({"cmd": "reload", "model": "broken.en"}) + "\n" +
+                json.dumps({"id": 1, "wav": str(wav), "initial_prompt": "", "raw": False}) + "\n" +
+                json.dumps({"cmd": "shutdown"}) + "\n"
+            )
+            with mock.patch.dict(sys.modules,
+                                 _fake_mlx_modules(selective, transcribe_fn=fake_transcribe)), \
+                 mock.patch("core.daemon._is_model_cached", return_value=True), \
+                 mock.patch("sys.stdin", stdin), \
+                 mock.patch("sys.stdout", out_buf):
+                daemon.main()
+
+        msgs = [json.loads(l) for l in out_buf.getvalue().splitlines() if l.strip()]
+        statuses = [m.get("status") for m in msgs]
+        boot_model = next(m for m in msgs if m.get("status") == "ready")["model"]
+        # error for the failed reload, then recovery ready on the OLD model...
+        self.assertIn("error", statuses)
+        err_idx = statuses.index("error")
+        recovery = next(m for m in msgs[err_idx + 1:] if m.get("status") == "ready")
+        self.assertEqual(recovery["model"], boot_model)
+        # ...and the old (real MLXModel) model still transcribes.
+        tx = next(m for m in msgs if "id" in m)
+        self.assertEqual(tx["text"], "still works")
+
+
+class ReloadGpuCacheTests(unittest.TestCase):
+    """F9: a successful model switch must release the old model's GPU memory;
+    a rolled-back (failed) switch must NOT evict the cache it's still using."""
+
+    def test_successful_reload_clears_gpu_cache(self):
+        calls = []
+        model_mock = mock.Mock()
+        model_mock.transcribe.return_value = ([], None)
+
+        stdin = io.StringIO(
+            json.dumps({"cmd": "reload", "model": "tiny.en"}) + "\n" +
+            json.dumps({"cmd": "shutdown"}) + "\n"
+        )
+        with mock.patch("core.daemon._load_model", return_value=model_mock), \
+             mock.patch("core.daemon._is_model_cached", return_value=True), \
+             mock.patch("core.daemon.asr.clear_gpu_cache",
+                        side_effect=lambda: calls.append(True)), \
+             mock.patch("sys.stdin", stdin), \
+             mock.patch("sys.stdout", io.StringIO()):
+            daemon.main()
+
+        self.assertEqual(calls, [True])
+
+    def test_failed_reload_does_not_clear_gpu_cache(self):
+        calls = []
+        good_model = mock.Mock()
+        good_model.transcribe.return_value = ([], None)
+
+        def _fake_load(name):
+            # Boot loads whatever model_name settings resolve to (real
+            # load_settings() isn't mocked here) — only the reload target
+            # ("broken") must fail, so boot always succeeds regardless of name.
+            if name == "broken":
+                raise RuntimeError("boom")
+            return good_model
+
+        stdin = io.StringIO(
+            json.dumps({"cmd": "reload", "model": "broken"}) + "\n" +
+            json.dumps({"cmd": "shutdown"}) + "\n"
+        )
+        with mock.patch("core.daemon._load_model", side_effect=_fake_load), \
+             mock.patch("core.daemon._is_model_cached", return_value=True), \
+             mock.patch("core.daemon.asr.clear_gpu_cache",
+                        side_effect=lambda: calls.append(True)), \
+             mock.patch("sys.stdin", stdin), \
+             mock.patch("sys.stdout", io.StringIO()):
+            daemon.main()
+
+        self.assertEqual(calls, [])
 
 
 class ConfigReloadTests(unittest.TestCase):

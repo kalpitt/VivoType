@@ -491,6 +491,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     "Couldn't load the model. Check your internet connection and tap Retry.")
             }
         }
+        daemon.onTranscribeError = { [weak self] _ in
+            // Full message is in the warn log + daemon.log; the toast just makes
+            // the failure visible while the CLI fallback retries the clip.
+            self?.toast?.show("⚠ Transcription error — retrying")
+        }
         daemonClient = daemon
         isDaemonLoading = true
         currentStatus = "Loading model…"
