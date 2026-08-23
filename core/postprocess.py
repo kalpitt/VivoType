@@ -53,6 +53,11 @@ DEFAULT_CONFIG = {
 _CURRENCY_RE = re.compile(r"\$(\d+(?:\.\d+)?)\s*([kKmM])\b")
 _SUFFIX_UNIT = {"k": "lakh", "m": "crore"}
 
+# Rupee mentions normalize to the ₹ symbol, adjacent-number only, so a bare
+# "rs"/"INR" with no amount next to it is never touched.
+_RS_PREFIX_RE = re.compile(r"\b(?:rs\.?|inr)\s*(\d[\d,]*(?:\.\d+)?)\b", re.IGNORECASE)
+_RUPEE_SUFFIX_RE = re.compile(r"\b(\d[\d,]*(?:\.\d+)?)\s*rupees?\b", re.IGNORECASE)
+
 # Spans the currency regex must never reach into. We protect double-quoted
 # strings but NOT single-quoted ones: apostrophes in contractions ("it's",
 # "isn't") would otherwise form bogus "quoted" spans and hide real amounts.
@@ -66,6 +71,24 @@ _PROTECT_PATTERNS = [
 # Null bytes never appear in ASR text, so they make a safe placeholder marker.
 _PLACEHOLDER_RE = re.compile("\x00(\\d+)\x00")
 
+# Devanagari letters/signs/digits, excluding the danda marks U+0964/U+0965
+# (those are punctuation and bind to the preceding word, not a script run).
+_DEVANAGARI = "ऀ-ॣ०-ॿ"
+_SCRIPT_JOIN_RES = [
+    re.compile(r"(?<=[%s])(?=[A-Za-z0-9₹$])" % _DEVANAGARI),  # मेरीmeeting, मुझे$10k
+    re.compile(r"(?<=[A-Za-z0-9])(?=[%s])" % _DEVANAGARI),    # officeजाना
+]
+
+
+def _space_script_boundaries(text):
+    """Insert a space where Devanagari and Latin/digit/currency runs are glued.
+
+    Runs BEFORE convert_currency so a glued amount ("मैंने50 rupees") is spaced
+    in time for the adjacent-token currency regexes to see it."""
+    for boundary in _SCRIPT_JOIN_RES:
+        text = boundary.sub(" ", text)
+    return text
+
 
 def _warn(message):
     """Emit a human-readable warning to stderr (never stdout, which carries text)."""
@@ -73,7 +96,8 @@ def _warn(message):
 
 
 def load_config(path=None, user_path=None):
-    """Load fillers + replacements, merging the personal overlay over the defaults."""
+    """Load fillers + replacements (+ optional profiles), merging the personal
+    overlay over the defaults."""
     path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
     data = None
     if path.exists():
@@ -108,7 +132,80 @@ def load_config(path=None, user_path=None):
         except (json.JSONDecodeError, OSError) as exc:
             _warn(f"ignoring unreadable dictionary overlay '{overlay_path}' ({exc}).")
 
-    return {"fillers": fillers, "replacements": replacements}
+    return {
+        "fillers": fillers,
+        "replacements": replacements,
+        "profiles": _validated_profiles(data.get("profiles") if data else None),
+    }
+
+
+def _validated_profiles(raw):
+    """Validate the optional 'profiles' object from a config file.
+
+    Each entry is {convert_currency?: bool, remove_fillers?: bool,
+    replacements?: {str: str}}. Invalid entries are skipped with one stderr
+    warning — never fatal (a hand-edited file must not break dictation). A
+    literal "default" key is ignored: the flat top-level rules ARE the default,
+    and two sources of truth for them would drift."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        _warn("ignoring 'profiles' (not a JSON object); using default rules only.")
+        return {}
+    profiles = {}
+    for name, entry in raw.items():
+        if name == "default":
+            _warn("ignoring profiles['default'] — top-level rules are the default; "
+                  "rename the profile instead.")
+            continue
+        ok = (
+            isinstance(name, str) and name and
+            isinstance(entry, dict) and
+            isinstance(entry.get("replacements", {}), dict) and
+            all(isinstance(k, str) and isinstance(v, str)
+                for k, v in entry.get("replacements", {}).items()) and
+            isinstance(entry.get("convert_currency", True), bool) and
+            isinstance(entry.get("remove_fillers", True), bool)
+        )
+        if ok:
+            profiles[name] = entry
+        else:
+            _warn(f"ignoring malformed profile '{name}' (must be an object with "
+                  "optional boolean convert_currency/remove_fillers and string "
+                  "replacements).")
+    return profiles
+
+
+# Unknown profile names are warned once per process, not once per utterance —
+# the daemon would otherwise repeat the warning on every dictation.
+_WARNED_PROFILES = set()
+
+
+def resolve_profile(config, name="default"):
+    """Resolve a named profile against the default rule set.
+
+    Returns {"fillers", "replacements", "convert_currency", "remove_fillers"}:
+    the flat top-level rules with the named profile's toggles applied and its
+    replacements merged OVER them (a context-specific term beats both the
+    shipped defaults and personally promoted terms). "default" or any unknown
+    name yields today's behavior unchanged."""
+    resolved = {
+        "fillers": list(config.get("fillers", [])),
+        "replacements": dict(config.get("replacements", {})),
+        "convert_currency": True,
+        "remove_fillers": True,
+    }
+    profiles = config.get("profiles") or {}
+    profile = profiles.get(name) if isinstance(name, str) else None
+    if profile is None:
+        if name != "default" and isinstance(name, str) and name not in _WARNED_PROFILES:
+            _WARNED_PROFILES.add(name)
+            _warn(f"unknown profile '{name}'; using default rules.")
+        return resolved
+    resolved["convert_currency"] = profile.get("convert_currency", True)
+    resolved["remove_fillers"] = profile.get("remove_fillers", True)
+    resolved["replacements"].update(profile.get("replacements", {}))
+    return resolved
 
 
 def config_mtime(path=None, user_path=None):
@@ -128,16 +225,18 @@ def config_mtime(path=None, user_path=None):
     return latest
 
 
-def _format_amount(num_str):
-    """Keep "1.5" as-is but normalize "1.0" -> "1" so "$1.0M" reads "₹1 crore"."""
-    if "." in num_str:
-        value = float(num_str)
-        return str(int(value)) if value.is_integer() else num_str
-    return num_str
+def _format_value(value):
+    """Render a float minimally: 1.0 -> "1", 2.5 -> "2.5" (shortest repr).
+
+    Rounds away binary-float noise first (0.1 * 100 == 10.000000000000002)."""
+    value = round(value, 6)
+    return str(int(value)) if value.is_integer() else str(value)
 
 
 def convert_currency(text):
-    """Relabel USD amounts to INR, skipping URLs, code spans, and quotes."""
+    """Relabel USD amounts to INR and normalize rupee mentions ("Rs 500",
+    "INR 500", "500 rupees") to the ₹ symbol, skipping URLs, code spans,
+    and quotes."""
     stash = []
 
     def _protect(match):
@@ -149,11 +248,21 @@ def convert_currency(text):
         masked = pattern.sub(_protect, masked)
 
     def _convert(match):
-        amount = _format_amount(match.group(1))
         unit = _SUFFIX_UNIT[match.group(2).lower()]
+        value = float(match.group(1))
+        # _format_value normalizes "1.0" -> "1" and "1.50" -> "1.5".
+        amount = _format_value(value)
+        # 100 lakh IS 1 crore — large sums are always spoken in crore, and
+        # fractional-crore sums ("₹0.5 crore") are always spoken in lakh.
+        if unit == "lakh" and value >= 100:
+            return "₹%s crore" % _format_value(value / 100)
+        if unit == "crore" and value < 1:
+            return "₹%s lakh" % _format_value(value * 100)
         return "₹%s %s" % (amount, unit)
 
     masked = _CURRENCY_RE.sub(_convert, masked)
+    masked = _RS_PREFIX_RE.sub(r"₹\1", masked)
+    masked = _RUPEE_SUFFIX_RE.sub(r"₹\1", masked)
 
     # Restore protected spans (loop handles spans nested inside one another).
     def _restore(match):
@@ -165,6 +274,43 @@ def convert_currency(text):
             break
         masked = restored
     return masked
+
+
+# A word or short phrase (1–4 words) repeated 3+ times back-to-back, e.g.
+# "guilty guilty guilty" or "thank you. thank you. thank you." — Whisper's
+# decoder-loop signature, not how people dictate. Backreference honours
+# IGNORECASE, so "Guilty guilty guilty" collapses too.
+_REPEAT_RE = re.compile(
+    r"(\S+?(?:\s+\S+?){0,3}?)"      # the repeating unit, shortest first (lazy,
+    r"(?:[\s,;:.!?।॥]+\1){2,}"      # so trailing punctuation stays a separator)
+    r"(?=[\s,;:.!?।॥]|$)",          # 2+ further copies (3+ total)
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _collapse_unit(match):
+    """Collapse one repetition run — unless the unit is a single character or
+    pure digits ("1 1 1 1" is someone dictating a PIN, "A A A" a spelling,
+    not a decoder loop)."""
+    unit = match.group(1)
+    if len(unit) == 1 or unit.replace(" ", "").isdigit():
+        return match.group(0)
+    return unit
+
+
+def collapse_repetitions(text):
+    """Collapse a word/phrase repeated 3+ times in a row to one occurrence.
+
+    Kills Whisper repetition loops (hallucinated "guilty guilty guilty …")
+    while leaving deliberate doubles ("very very good") and digit/single-char
+    runs (PINs, spelled letters) untouched. A deliberate triple ("no no no")
+    is collapsed too — the accepted cost of stopping the loops. Applied
+    repeatedly until stable so nested loops fully unwind."""
+    while True:
+        collapsed = _REPEAT_RE.sub(_collapse_unit, text)
+        if collapsed == text:
+            return text
+        text = collapsed
 
 
 def remove_fillers(text, fillers):
@@ -203,18 +349,59 @@ def apply_replacements(text, replacements):
 def _normalize_whitespace(text):
     """Tidy spacing/punctuation left behind by filler removal."""
     text = re.sub(r"\s+", " ", text)                     # collapse whitespace runs
-    text = re.sub(r"\s+([,.!?;:])", r"\1", text)         # no space before punctuation
+    # A removed filler between two marks leaves "word. . Then" — keep the first
+    # mark only. Requires whitespace between marks so a real "..." survives.
+    # । (danda) and ॥ (double danda) are Devanagari sentence punctuation.
+    text = re.sub(r"([,.!?;:।॥])(?:\s+[,.!?;:।॥])+", r"\1", text)
+    text = re.sub(r"\s+([,.!?;:।॥])", r"\1", text)       # no space before punctuation
+    text = re.sub(r"।(?=[^\s।॥])", "। ", text)           # danda binds left, space follows
+    text = re.sub(r"(?<=\d)\s+%", "%", text)             # "10 %" -> "10%"
+    text = re.sub(r"([₹$])\s+(?=\d)", r"\1", text)       # "₹ 500" -> "₹500"
     text = re.sub(r"([,;:])(?:\s*[,;:])+", r"\1", text)  # collapse repeated commas etc.
     text = re.sub(r"^[\s,;:]+", "", text)                # trim leading punctuation/space
+    # A leading filler like "Um." leaves an orphan mark ("Um. Then" → ". Then").
+    # Strip a single sentence mark + following space only — not "^[.]+", which
+    # would eat a genuine leading ellipsis ("... okay").
+    text = re.sub(r"^[.!?;:।॥]\s+", "", text)
     return text.strip()
 
 
-def postprocess(text, config=None):
-    """Run the full cleanup pipeline on a transcript string."""
+def _restore_leading_capital(original, text):
+    """Re-capitalize a sentence whose opening filler was stripped.
+
+    "Um, actually we go." -> cleanup yields "actually we go." — the lowercase
+    start is a pipeline artifact, not the speaker's. Only fires when the original
+    began uppercase, the result begins lowercase, and the new first word is fully
+    lowercase (so "iPhone" is never forced to "IPhone")."""
+    if not text or not text[0].islower():
+        return text
+    first_alpha = next((c for c in original if c.isalpha()), "")
+    if not first_alpha.isupper():
+        return text
+    first_word = re.match(r"[^\W\d_]+", text, flags=re.UNICODE)
+    if first_word and not first_word.group(0).islower():
+        return text
+    return text[0].upper() + text[1:]
+
+
+def postprocess(text, config=None, profile="default"):
+    """Run the full cleanup pipeline on a transcript string.
+
+    `profile` selects a named context from config["profiles"] (per-app rules):
+    only convert_currency and remove_fillers are toggleable, and the profile's
+    replacements merge over the defaults. "default" (or an unknown name) is
+    exactly the historical behavior."""
     if config is None:
         config = load_config()
-    text = convert_currency(text)
-    text = remove_fillers(text, config.get("fillers", []))
-    text = apply_replacements(text, config.get("replacements", {}))
+    resolved = resolve_profile(config, profile)
+    original = text
+    text = collapse_repetitions(text)
+    text = _space_script_boundaries(text)
+    if resolved["convert_currency"]:
+        text = convert_currency(text)
+    if resolved["remove_fillers"]:
+        text = remove_fillers(text, resolved["fillers"])
+    text = apply_replacements(text, resolved["replacements"])
     text = correct_names(text)  # snap near-miss proper nouns to known contacts
-    return _normalize_whitespace(text)
+    text = _normalize_whitespace(text)
+    return _restore_leading_capital(original, text)

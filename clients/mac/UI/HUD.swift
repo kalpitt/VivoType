@@ -39,20 +39,26 @@ final class MeterView: NSView {
     }
 }
 
-/// The transient "● Listening…" HUD shown while the hotkey is held, and the
-/// persistent "● Hands-free" badge shown during toggle dictation.
+/// The transient "● Listening…" HUD shown while the hotkey is held, the
+/// persistent "● Hands-free" badge shown during toggle dictation, and the
+/// "● Processing…" state shown while the clip is being transcribed — so the
+/// indicator never vanishes mid-flow (the only other signal is the tiny
+/// menu-bar icon, which nobody is looking at).
 final class RecordingPill {
     private let panel: NonActivatingPanel
     private let meter: MeterView
+    private let spinner = NSProgressIndicator()
     private let dot = NSView()
     private let label = NSTextField(labelWithString: "Listening…")
     // Bumped on every show(); a pending hide() that finds it changed skips its
     // orderOut so a quick hide→show (double-tap → hands-free) can't blank the pill.
     private var showToken = 0
     // Distinct accents per mode: green = momentary push-to-talk, red = the
-    // continuous hands-free mode (red reads as "actively recording, hands-off").
+    // continuous hands-free mode (red reads as "actively recording, hands-off"),
+    // blue = transcribing (matches the menu's status dot for the same state).
     private let holdAccent = NSColor.systemGreen
     private let handsFreeAccent = NSColor.systemRed
+    private let processingAccent = NSColor.systemBlue
 
     init() {
         let width: CGFloat = 200
@@ -85,7 +91,13 @@ final class RecordingPill {
         meter = MeterView()
         meter.translatesAutoresizingMaskIntoConstraints = false
 
-        let stack = NSStackView(views: [dot, label, meter])
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isDisplayedWhenStopped = false
+        spinner.isHidden = true
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView(views: [dot, label, meter, spinner])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .horizontal
         stack.alignment = .centerY
@@ -109,6 +121,19 @@ final class RecordingPill {
         let accent = handsFree ? handsFreeAccent : holdAccent
         dot.layer?.backgroundColor = accent.cgColor
         meter.accent = accent
+        meter.isHidden = false
+        spinner.stopAnimation(nil)
+        spinner.isHidden = true
+    }
+
+    /// The split-second between key-release and text landing: keep the pill up
+    /// with "Processing…" + a spinner instead of vanishing. Call before show().
+    func setProcessing() {
+        label.stringValue = "Processing…"
+        dot.layer?.backgroundColor = processingAccent.cgColor
+        meter.isHidden = true
+        spinner.isHidden = false
+        spinner.startAnimation(nil)
     }
 
     func show() {

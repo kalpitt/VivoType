@@ -11,12 +11,15 @@ from core import asr
 from core.asr import _Segment, speech_segments
 
 
-def _fake_mlx_modules(get_model, transcribe_fn=None):
-    """Build sys.modules entries faking mlx / mlx_whisper.
+def _fake_mlx_modules(get_model, transcribe_fn=None, download_fn=None):
+    """Build sys.modules entries faking mlx / mlx_whisper / huggingface_hub.
 
     `get_model(repo, dtype)` backs ModelHolder.get_model (the warm-up path);
     `transcribe_fn` (optional) backs mlx_whisper.transcribe() for tests that
-    exercise a real MLXModel end-to-end. Shared with test_daemon.py.
+    exercise a real MLXModel end-to-end; `download_fn` (optional) backs
+    huggingface_hub.snapshot_download (load_model's bounded download step —
+    default: instant no-op so no test ever touches the network). Shared with
+    test_daemon.py.
     """
     fake_mx = types.ModuleType("mlx.core")
     fake_mx.float16 = "float16"
@@ -33,11 +36,15 @@ def _fake_mlx_modules(get_model, transcribe_fn=None):
     # `mlx_whisper.transcribe(audio, ...)` invokes — mirroring the real package.
     fake_whisper.transcribe = transcribe_fn if transcribe_fn else fake_transcribe_mod
 
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.snapshot_download = download_fn if download_fn else (lambda *a, **k: None)
+
     return {
         "mlx": fake_mlx,
         "mlx.core": fake_mx,
         "mlx_whisper": fake_whisper,
         "mlx_whisper.transcribe": fake_transcribe_mod,
+        "huggingface_hub": fake_hub,
     }
 
 
@@ -103,14 +110,45 @@ class WarmupFailureTests(unittest.TestCase):
         self.assertEqual(model.model_name, "small.en")
 
 
-class LoadModelTimeoutTests(unittest.TestCase):
-    """F7: a stalled download/load must not hang the daemon forever."""
+class TranscribeOptionsTests(unittest.TestCase):
+    """Decode options that keep hallucinations down must actually reach
+    mlx_whisper.transcribe()."""
 
-    def test_stalled_load_raises_timeout_error(self):
-        def slow(repo, dtype):
+    def _captured_opts(self):
+        captured = {}
+
+        def fake_transcribe(audio, **opts):
+            captured.update(opts)
+            return {"segments": []}
+
+        with mock.patch.dict(sys.modules,
+                             _fake_mlx_modules(lambda *a: None,
+                                               transcribe_fn=fake_transcribe)):
+            model = asr.load_model("small.en")
+            model.transcribe([0.0] * 160)
+        return captured
+
+    def test_condition_on_previous_text_disabled(self):
+        # Feeding each segment back as context is what turns one misheard word
+        # into a "guilty guilty guilty" loop — must be off for dictation clips.
+        self.assertIs(self._captured_opts().get("condition_on_previous_text"), False)
+
+    def test_verbose_stays_off(self):
+        # stdout is the daemon's NDJSON channel.
+        self.assertIs(self._captured_opts().get("verbose"), False)
+
+
+class LoadModelTimeoutTests(unittest.TestCase):
+    """F7: a stalled DOWNLOAD must not hang the daemon forever. Only the
+    network-bound download is time-bounded on a worker thread — the Metal
+    warm-up must stay on the calling thread (see thread-affinity test)."""
+
+    def test_stalled_download_raises_timeout_error(self):
+        def slow_download(*args, **kwargs):
             time.sleep(0.5)
 
-        with mock.patch.dict(sys.modules, _fake_mlx_modules(slow)):
+        mods = _fake_mlx_modules(lambda *a: None, download_fn=slow_download)
+        with mock.patch.dict(sys.modules, mods):
             with self.assertRaises(TimeoutError) as ctx:
                 asr.load_model("small.en", timeout=0.05)
         # The message must be self-explanatory in the daemon's NDJSON error.
@@ -118,12 +156,42 @@ class LoadModelTimeoutTests(unittest.TestCase):
         self.assertIn("timed out", str(ctx.exception))
 
     def test_fast_load_returns_before_timeout(self):
-        def fast(repo, dtype):
-            return None
-
-        with mock.patch.dict(sys.modules, _fake_mlx_modules(fast)):
+        with mock.patch.dict(sys.modules, _fake_mlx_modules(lambda *a: None)):
             model = asr.load_model("small.en", timeout=5)
         self.assertEqual(model.model_name, "small.en")
+
+    def test_download_failure_falls_through_to_load_error(self):
+        # A fast download failure (offline, no cache) must surface as the
+        # load's own clear RuntimeError, not be swallowed into a false success.
+        def offline(*args, **kwargs):
+            raise OSError("offline")
+
+        def boom(repo, dtype):
+            raise OSError("no cached weights")
+
+        mods = _fake_mlx_modules(boom, download_fn=offline)
+        with mock.patch.dict(sys.modules, mods):
+            with self.assertRaises(RuntimeError) as ctx:
+                asr.load_model("small.en", timeout=5)
+        self.assertIn("no cached weights", str(ctx.exception))
+
+
+class LoadModelThreadAffinityTests(unittest.TestCase):
+    """MLX GPU streams are thread-local: a model warmed on a worker thread
+    makes transcribe() on the calling thread fail with 'There is no
+    Stream(gpu, N) in current thread' (field-verified on Apple Silicon).
+    The warm-up must therefore run on the caller's thread."""
+
+    def test_warmup_runs_on_calling_thread(self):
+        import threading
+        warmup_threads = []
+
+        def record(repo, dtype):
+            warmup_threads.append(threading.get_ident())
+
+        with mock.patch.dict(sys.modules, _fake_mlx_modules(record)):
+            asr.load_model("small.en", timeout=5)
+        self.assertEqual(warmup_threads, [threading.get_ident()])
 
 
 class ClearGpuCacheTests(unittest.TestCase):

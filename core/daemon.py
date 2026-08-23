@@ -13,11 +13,19 @@ Protocol — NDJSON over stdin/stdout:
     {"status":"error","error":"<message>"}
 
   Transcription request (app → daemon):
-    {"id":<int>,"wav":"<path>","initial_prompt":"<str>","raw":<bool>}
+    {"id":<int>,"wav":"<path>","initial_prompt":"<str>","raw":<bool>,
+     "profile":"<name>"}          # optional; selects post-processing rules
+                                  # from postprocess_config.json 'profiles'
+                                  # (per-app contexts). Missing/unknown ->
+                                  # default rules.
 
   Transcription response (daemon → app):
-    {"id":<int>,"text":"<str>"}
+    {"id":<int>,"text":"<str>","command":"scratch_that"|null}
     {"id":<int>,"error":"<str>"}
+    # "command" is present (null) on every normal reply; only the exact
+    # string "scratch_that" ever appears — it asks the client to delete its
+    # previously injected text (see core/commands.py). Error replies carry
+    # no command key.
 
   Control (app → daemon):
     {"cmd":"reload","model":"<name>"}   # switch model; daemon re-emits loading then
@@ -42,17 +50,19 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 try:
-    from core.audioio import load_wav
+    from core.audioio import has_speech, load_wav
     from core.postprocess import config_mtime, load_config, postprocess
+    from core.commands import apply_transform, detect_command
     from core.config import load_settings
     from core import asr
-    from core.asr import speech_segments
+    from core.asr import is_prompt_echo, speech_segments
 except ImportError:
-    from audioio import load_wav
+    from audioio import has_speech, load_wav
     from postprocess import config_mtime, load_config, postprocess
+    from commands import apply_transform, detect_command
     from config import load_settings
     import asr
-    from asr import speech_segments
+    from asr import is_prompt_echo, speech_segments
 
 
 def _emit(obj: dict) -> None:
@@ -71,12 +81,18 @@ def _load_model(model_name: str):
 
 
 def _transcribe(model, wav_path: str, initial_prompt: str, raw: bool,
-                pp_config: dict) -> dict:
+                pp_config: dict, profile: str = "default") -> dict:
     """Transcribe one WAV; return {"text": ...} or {"error": ...}."""
     try:
         audio = load_wav(wav_path)
     except Exception as exc:
         return {"error": f"load_wav: {exc}"}
+
+    # Silence gate: never hand a silent clip to Whisper — on silence it
+    # hallucinates (echoes the initial_prompt, loops a word). Raw mode skips
+    # the gate so it stays a true diagnostic window into the model.
+    if not raw and not has_speech(audio):
+        return {"text": "", "command": None}
 
     try:
         kwargs: dict = {}
@@ -102,15 +118,63 @@ def _transcribe(model, wav_path: str, initial_prompt: str, raw: bool,
             )
             for s in segs
         ]
-        return {"text": "\n".join(lines)}
+        return {"text": "\n".join(lines), "command": None}
 
     # Drop non-speech segments (silence echoes the initial_prompt) before joining.
-    text = " ".join(s.text.strip() for s in speech_segments(segs)).strip()
+    # Skip empty strips so a blank segment cannot invent a double space before
+    # postprocess (or leave one when --no-clean / postprocess fails).
+    text = " ".join(
+        t for s in speech_segments(segs) if (t := s.text.strip())
+    ).strip()
+
+    # Command detection runs on RAW ASR text BEFORE cleanup: promoted-name
+    # replacements or capitalization could rewrite a literal phrase otherwise
+    # ("cap that" with a cap->Capitol rule). Configured leading fillers are
+    # stripped for scratch matching — Whisper habitually prefixes "um", and a
+    # filler must not turn a spoken command into typed text. A structural
+    # scratch returns immediately — there is nothing to clean or inject. The
+    # commands module is wrapped like every other stage: a raise must never
+    # kill the daemon, it just degrades to plain dictation.
     try:
-        text = postprocess(text, pp_config)
-    except Exception:
-        pass  # post-processing failure is non-fatal; return raw ASR text
-    return {"text": text}
+        signal, remaining, transform = detect_command(
+            text, leading_fillers=pp_config.get("fillers"))
+    except Exception as exc:
+        print(
+            f"VivoType: command detection failed ({exc}); treating as dictation",
+            file=sys.stderr,
+        )
+        signal, remaining, transform = None, text, "none"
+    if signal == "scratch_that":
+        return {"text": "", "command": "scratch_that"}
+
+    # Postprocess BEFORE the echo guard: Whisper often prefixes fillers
+    # ("um VivoType, menu"), which would fail a raw-token echo check and then
+    # become a clean prompt insertion after filler stripping.
+    raw_asr = remaining
+    try:
+        text = postprocess(remaining, pp_config, profile=profile)
+    except Exception as exc:
+        # Keep the transcription — a bad regex / overlay must not drop speech.
+        # Transform is skipped too: applying it to unclean raw text is worse
+        # than returning it as dictated (keep-raw precedent).
+        print(
+            f"VivoType: postprocess failed ({exc}); returning raw ASR text",
+            file=sys.stderr,
+        )
+        text = raw_asr
+    else:
+        try:
+            text = apply_transform(text, transform)
+        except Exception as exc:
+            print(
+                f"VivoType: command transform failed ({exc}); returning cleaned text",
+                file=sys.stderr,
+            )
+    # The echo guard runs on BOTH paths — a failed cleanup must not turn into
+    # a prompt-echo injection either.
+    if is_prompt_echo(text, initial_prompt):
+        return {"text": "", "command": None}
+    return {"text": text, "command": None}
 
 
 def main() -> None:
@@ -119,6 +183,7 @@ def main() -> None:
         model_name: str = settings.get("model", "small.en")
         pp_config = load_config()
         pp_mtime = config_mtime()  # baseline for live dictionary/filler reloads
+        failed_reload_mtime = None  # last mtime whose reload raised (warn-once)
     except Exception as exc:
         # A corrupt config.json / postprocess config must not kill the daemon
         # with a bare traceback on stderr — emit a proper NDJSON error so the
@@ -182,17 +247,37 @@ def main() -> None:
         wav = cmd.get("wav", "")
         initial_prompt = cmd.get("initial_prompt", "") or ""
         raw = bool(cmd.get("raw", False))
+        # A non-string profile (or an empty one) must degrade to the default
+        # rules, never skip cleanup: resolve_profile would treat junk as an
+        # unknown name anyway, but normalizing here keeps the contract explicit.
+        profile = cmd.get("profile", "default")
+        if not isinstance(profile, str) or not profile:
+            profile = "default"
 
-        # Pick up dictionary/filler edits (e.g. a promoted term) without a restart.
+        # Pick up dictionary/filler/profile edits (e.g. a promoted term) without
+        # a restart. A reload that RAISES (e.g. a wrong-typed field that slips
+        # past load_config's own guards) must not kill the daemon mid-request:
+        # keep serving the last-good rules and warn once per distinct mtime, so
+        # a left-corrupt file doesn't spam stderr on every dictation.
         current_mtime = config_mtime()
         if current_mtime != pp_mtime:
-            pp_config = load_config()
-            pp_mtime = current_mtime
+            try:
+                new_config = load_config()
+                pp_config = new_config
+                pp_mtime = current_mtime
+                failed_reload_mtime = None  # re-arm warn-once for future failures
+            except Exception as exc:
+                if current_mtime != failed_reload_mtime:
+                    failed_reload_mtime = current_mtime
+                    print(
+                        f"VivoType: config reload failed ({exc}); keeping previous rules.",
+                        file=sys.stderr,
+                    )
 
         if model is None:
             result = {"error": "ASR model is not loaded."}
         else:
-            result = _transcribe(model, wav, initial_prompt, raw, pp_config)
+            result = _transcribe(model, wav, initial_prompt, raw, pp_config, profile)
         result["id"] = req_id
         _emit(result)
     # stdin EOF → clean exit (app died or sent shutdown)

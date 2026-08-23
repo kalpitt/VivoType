@@ -22,6 +22,20 @@ class DiffTests(unittest.TestCase):
         out = learn.diff_corrections("meet Zovind Sousa today", "meet Zubin Souza today")
         self.assertTrue(any("Souza" in c["to"] for c in out))
 
+    def test_digit_swap_not_recorded(self):
+        # '7' -> 'driven' (observed in the field): a numeral being replaced by
+        # a word is an edit, not a mishearing — it must never enter the queue.
+        self.assertEqual(learn.diff_corrections("the 7 team", "the driven team"), [])
+
+    def test_single_char_swap_not_recorded(self):
+        self.assertEqual(learn.diff_corrections("plan a now", "plan b now"), [])
+
+    def test_real_word_pair_still_recorded(self):
+        corrections = learn.diff_corrections("call wani today", "call Vaani today")
+        self.assertEqual(len(corrections), 1)
+        self.assertEqual(corrections[0]["from"], "wani")
+        self.assertEqual(corrections[0]["to"], "Vaani")
+
     def test_accented_word_recorded_whole(self):
         # The tokenizer must keep non-ASCII letters; otherwise "José" tokenizes as
         # "Jos" and the learned correction records the wrong (truncated) target.

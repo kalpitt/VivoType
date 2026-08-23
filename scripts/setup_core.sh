@@ -42,6 +42,16 @@ mkdir -p "$APP_SUPPORT"
 # python3.14 is preferred over the system python3), then the generic names.
 # The explicit upper bound is generous so new releases are picked up without
 # another code change.
+#
+# When launched from the .app, this script inherits the GUI's minimal PATH
+# (/usr/bin:/bin:...), which does NOT include where python.org (/usr/local/bin
+# + the framework dir) or Homebrew (/opt/homebrew/bin) put Python — so a
+# perfectly good interpreter looked "missing" (exit 42). Prepend those dirs.
+PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+for _fw in /Library/Frameworks/Python.framework/Versions/3.*/bin; do
+  [ -d "$_fw" ] && PATH="$_fw:$PATH"
+done
+export PATH
 is_compatible() {
   "$1" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 11) else 1)' >/dev/null 2>&1
 }

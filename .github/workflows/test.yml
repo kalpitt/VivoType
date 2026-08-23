@@ -1,10 +1,27 @@
 name: CI
 
+# Budget note (private repo => GitHub-hosted minutes bill against the free
+# monthly quota; macOS runners cost ~10x a Linux minute):
+#   - docs/context-only pushes skip CI entirely (paths-ignore below)
+#   - the expensive macOS build runs only where it matters: PRs to main and
+#     manual dispatches — ordinary branch pushes get the Linux matrix only.
 on:
   push:
-    branches: ['**']   # every branch, so feature-branch pushes run CI too
+    branches: ['**']
+    paths-ignore:
+      - 'docs/**'
+      - 'context/**'
+      - 'branding/**'
+      - 'homebrew/**'
+      - '**.md'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'context/**'
+      - 'branding/**'
+      - 'homebrew/**'
+      - '**.md'
   workflow_dispatch:
 
 # Cancel an in-progress run when a newer commit is pushed to the same ref.
@@ -19,10 +36,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.9 is the minimum the core/ source supports; 3.11 is the minimum the
-        # runtime venv requires (setup_core.sh); 3.13 guards against regressions
-        # on the newest interpreters.
-        python-version: ["3.9", "3.11", "3.13"]
+        # Two versions cover the contract: 3.9 is the minimum core/ must
+        # support (core/CLAUDE.md); 3.11 is the version the runtime venv
+        # actually uses (setup_core.sh). Linux minutes are cheap enough to
+        # gate every push.
+        python-version: ["3.9", "3.11"]
 
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +66,14 @@ jobs:
   swift-build:
     name: macOS build (Swift)
     runs-on: macos-latest
+    # macOS runners bill ~10x Linux minutes against the free quota, so this
+    # job runs only where a broken build can actually merge or ship: PRs,
+    # main itself, and manual dispatches. Feature-branch pushes are covered by
+    # the Python matrix; their final PR check builds for real.
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
 
     steps:
       - uses: actions/checkout@v4

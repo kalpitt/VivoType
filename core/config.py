@@ -44,6 +44,8 @@ DEFAULTS = {
     "hotkey_label": "Right Option",
     "sound_enabled": True,
     "toast_enabled": True,
+    "hud_enabled": True,         # False = sound-only, no on-screen recording pill
+    "app_profiles": {},          # frontmost bundle ID -> postprocess profile name
 }
 
 
@@ -59,6 +61,26 @@ def load_settings(path=None):
                 settings.update(data)
         except (json.JSONDecodeError, OSError):
             pass  # keep defaults on a corrupt/unreadable file
+    # Soft type checks: a hand-edited "model": 123 must not become
+    # whisper-123-mlx via asr.repo_for — fall back to the typed default.
+    if not isinstance(settings.get("model"), str) or not settings["model"]:
+        settings["model"] = DEFAULTS["model"]
+    if not isinstance(settings.get("hotkey_keycode"), int):
+        settings["hotkey_keycode"] = DEFAULTS["hotkey_keycode"]
+    if not isinstance(settings.get("hotkey_label"), str):
+        settings["hotkey_label"] = DEFAULTS["hotkey_label"]
+    for flag in ("sound_enabled", "toast_enabled", "hud_enabled"):
+        if not isinstance(settings.get(flag), bool):
+            settings[flag] = DEFAULTS[flag]
+    # app_profiles must be a {bundle ID -> profile name} dict; a hand-edited
+    # non-dict (or one with non-string values) falls back to empty rather than
+    # leaking junk into the daemon protocol or crashing resolution.
+    app_profiles = settings.get("app_profiles")
+    if not isinstance(app_profiles, dict) or not all(
+        isinstance(k, str) and k and isinstance(v, str)
+        for k, v in app_profiles.items()
+    ):
+        settings["app_profiles"] = {}
     return settings
 
 

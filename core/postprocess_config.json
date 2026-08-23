@@ -1,5 +1,5 @@
 {
-  "_comment": "Edit these lists to tune VivoType's transcript cleanup. 'fillers' are removed as whole words (case-insensitive). 'replacements' map a spoken/misrecognized term to its correct form. Currency conversion ($->INR) is handled in code, not here.",
+  "_comment": "Edit these lists to tune VivoType's transcript cleanup. 'fillers' are removed as whole words (case-insensitive). 'replacements' map a spoken/misrecognized term to its correct form. Currency conversion ($->INR) is handled in code, not here. 'profiles' defines optional named contexts (per-app rules via Settings): each may set convert_currency/remove_fillers (default true) and extra 'replacements' that override the ones above. Map apps to profiles in VivoType's Settings; unmapped apps use the top-level rules.",
   "fillers": [
     "um",
     "uh",
@@ -15,5 +15,11 @@
     "shrivastava": "Srivastava",
     "iit": "IIT",
     "upi": "UPI"
+  },
+  "profiles": {
+    "code": {
+      "convert_currency": false,
+      "remove_fillers": false
+    }
   }
 }

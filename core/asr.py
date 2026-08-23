@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import re
 
 try:  # sibling module; works whether imported as a package or a loose script
     from core.paths import models_dir
@@ -97,6 +98,34 @@ def speech_segments(segments, threshold: float = NO_SPEECH_THRESHOLD):
     return [s for s in segments if getattr(s, "no_speech_prob", 0.0) < threshold]
 
 
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def is_prompt_echo(text: str, prompt: str) -> bool:
+    """True when the transcript is nothing but the initial_prompt echoed back.
+
+    On silence/noise Whisper sometimes returns its vocabulary hint verbatim
+    with a LOW no_speech_prob, sailing past speech_segments(). Comparing
+    normalized token sequences catches exactly that ("VivoType, menu" for a
+    prompt of "VivoType, menu") — including the prompt echoed N times in a
+    row (a common loop variant) — while leaving real dictation that merely
+    *contains* prompt terms untouched.
+
+    Shared by the daemon and the one-shot CLI so both paths drop the same
+    hallucination.
+    """
+    if not prompt or not text:
+        return False
+    text_tokens = _TOKEN_RE.findall(text.lower())
+    prompt_tokens = _TOKEN_RE.findall(prompt.lower())
+    if not prompt_tokens or not text_tokens:
+        return False
+    if len(text_tokens) % len(prompt_tokens) != 0:
+        return False
+    repeats = len(text_tokens) // len(prompt_tokens)
+    return text_tokens == prompt_tokens * repeats
+
+
 class MLXModel:
     """A warm, reusable MLX Whisper model.
 
@@ -149,6 +178,11 @@ class MLXModel:
             # stdout is the daemon's NDJSON channel — mlx-whisper must never
             # print progress to it.
             "verbose": False,
+            # Don't feed each segment's text back as context for the next:
+            # on noisy/marginal audio that feedback loop is what turns one
+            # misheard word into "guilty guilty guilty …". Dictation clips are
+            # single short utterances, so cross-segment context adds nothing.
+            "condition_on_previous_text": False,
         }
         if initial_prompt:
             opts["initial_prompt"] = initial_prompt
@@ -169,29 +203,50 @@ class MLXModel:
 
 # A stalled connection during the one-time model download (~466 MB for
 # small.en) must not hang the daemon forever with "Downloading model…" spinning
-# with no way out. Bounds the whole load+warm-up by wall-clock time.
+# with no way out. Bounds the network-bound download by wall-clock time.
 MODEL_LOAD_TIMEOUT = 180  # seconds
+
+
+def _ensure_downloaded(model_name: str) -> None:
+    """Fetch the model files if missing (network-bound, GPU-free).
+
+    Safe to run on a worker thread: it never touches Metal. The local
+    (offline) check runs first so a cached model boots without any network.
+    """
+    from huggingface_hub import snapshot_download
+    repo = repo_for(model_name)
+    try:
+        snapshot_download(repo, local_files_only=True)
+        return  # already cached
+    except Exception:
+        pass
+    snapshot_download(repo)
 
 
 def load_model(model_name: str, timeout: float = MODEL_LOAD_TIMEOUT) -> MLXModel:
     """Build (and warm) an MLX Whisper model for the given Whisper size.
 
-    Runs the load on a worker thread so a stalled download can be bounded by
-    `timeout` instead of hanging the caller indefinitely. The load itself
-    (native HTTP + Metal calls) isn't cooperatively interruptible, so on
-    timeout this abandons the wait and raises — the background thread may
-    keep running until its own socket-level timeout fires, but the daemon can
-    immediately report the failure and move on (see core/daemon.py's error
-    path) instead of blocking the whole process.
+    Only the download runs on a worker thread (bounded by `timeout`); the
+    Metal load/warm-up MUST happen on the calling thread. MLX GPU streams are
+    thread-local — a model warmed on a worker thread makes transcribe() on
+    the calling thread fail with "There is no Stream(gpu, N) in current
+    thread". (Field-verified on Apple Silicon; the previous version warmed on
+    the worker and broke every transcription.)
     """
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(MLXModel, model_name)
+    future = pool.submit(_ensure_downloaded, model_name)
     try:
-        return future.result(timeout=timeout)
+        future.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
         raise TimeoutError(
-            f"loading model '{model_name}' timed out after {int(timeout)}s "
+            f"downloading model '{model_name}' timed out after {int(timeout)}s "
             "(stalled download or network issue)"
         ) from None
+    except Exception:
+        # huggingface_hub missing/refactored, or a fast download failure —
+        # fall through: the real load below surfaces any genuine problem
+        # with a clear message (and MLXModel's own error path handles it).
+        pass
     finally:
-        pool.shutdown(wait=False)  # don't block on a still-running load
+        pool.shutdown(wait=False)  # don't block on a still-running download
+    return MLXModel(model_name)

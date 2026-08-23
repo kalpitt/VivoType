@@ -3,6 +3,7 @@
 // Support state. No UI here; everything in this file is usable headlessly.
 
 import Foundation
+import Darwin  // kill()/SIGKILL for hang recovery and runProcess backstop
 
 // MARK: - helpers
 
@@ -16,7 +17,8 @@ enum VivoTypeState {
 
 /// Run a process, draining stdout+stderr concurrently so a chatty child (e.g. a
 /// model-download progress bar) can never fill a pipe and deadlock. A watchdog
-/// terminates a child that overruns `timeout`, so the app never wedges.
+/// SIGTERMs a child that overruns `timeout`, then SIGKILLs after a short grace
+/// so a wedged MLX/native call cannot hang the app forever.
 func runProcess(_ executable: String, _ args: [String],
                 timeout: TimeInterval = 120) -> (stdout: String, stderr: String, status: Int32) {
     let proc = Process()
@@ -41,12 +43,31 @@ func runProcess(_ executable: String, _ args: [String],
     group.enter()
     queue.async { errData = errPipe.fileHandleForReading.readDataToEndOfFile(); group.leave() }
 
-    let watchdog = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
-    queue.asyncAfter(deadline: .now() + timeout, execute: watchdog)
+    let killGrace: TimeInterval = 2
+    // Absolute ceiling: timeout + SIGTERM grace + small slack for pipe EOF after SIGKILL.
+    let hardCeiling = timeout + killGrace + 5
 
-    group.wait()            // both pipes read to EOF (child closed them)
-    proc.waitUntilExit()
-    watchdog.cancel()
+    let termWatchdog = DispatchWorkItem {
+        if proc.isRunning { proc.terminate() }
+    }
+    let killWatchdog = DispatchWorkItem {
+        if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
+    }
+    queue.asyncAfter(deadline: .now() + timeout, execute: termWatchdog)
+    queue.asyncAfter(deadline: .now() + timeout + killGrace, execute: killWatchdog)
+
+    let pipeWait = group.wait(timeout: .now() + hardCeiling)
+    if pipeWait == .timedOut, proc.isRunning {
+        kill(proc.processIdentifier, SIGKILL)
+    }
+    if proc.isRunning {
+        proc.waitUntilExit()
+    } else {
+        // Already exited — still reap status (returns immediately).
+        proc.waitUntilExit()
+    }
+    termWatchdog.cancel()
+    killWatchdog.cancel()
 
     return (String(data: outData, encoding: .utf8) ?? "",
             String(data: errData, encoding: .utf8) ?? "",

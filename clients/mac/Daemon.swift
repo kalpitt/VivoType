@@ -3,6 +3,7 @@
 // stdin/stdout. On crash, callers receive nil and fall back to the one-shot CLI.
 
 import Foundation
+import Darwin  // kill()/SIGKILL for the hang-recovery watchdog
 
 // MARK: - Daemon client
 
@@ -31,6 +32,41 @@ final class DaemonClient {
     private var pythonPath = ""
     private var repoRoot = ""
 
+    /// Consecutive per-request failures (timeouts OR per-request errors) with
+    /// no SUCCESSFUL transcription in between — the hang-detection signal
+    /// (distinct from a hard crash). A daemon that stays alive but replies
+    /// with nothing but errors is just as broken as one that never replies,
+    /// so both count. Reset by any genuine model answer: an actual `text`
+    /// reply or a structural "scratch_that" reply (both prove the daemon is
+    /// healthy); an error reply does not.
+    private var consecutiveFailures = 0
+    /// How many times this client has force-restarted a *hung* (not crashed)
+    /// daemon, for its ENTIRE lifetime — capped independently of
+    /// didAutoRestart so a hang and a crash can't consume each other's
+    /// budget. Deliberately never reset by a success: the point is to bound
+    /// total restarts even against a daemon that hangs intermittently
+    /// (hang, recover, hang, recover...), not just one that hangs forever.
+    private var hangRestartCount = 0
+    /// True between restartAfterHang()'s kill and the resulting handleEOF —
+    /// tells handleEOF this death was deliberate so it respawns without
+    /// consuming didAutoRestart (the crash-restart budget). Also used to
+    /// ignore any further status messages from the process being killed.
+    private var expectingHangRestart = false
+    /// True after hang-budget exhaustion: the next EOF must not crash-respawn
+    /// a daemon we've already given up on (CLI fallback stays active until
+    /// the user picks "Restart speech engine").
+    private var abandonProcess = false
+    /// 2 consecutive failures (not 1 — a single one is ambiguous and a
+    /// respawn costs a 2-4s model reload) means the daemon is alive but wedged.
+    private static let hangTimeoutThreshold = 2
+    /// Bounded so a systemically-hanging model/daemon can't restart forever;
+    /// after this, the CLI fallback stays active until a manual "Restart
+    /// speech engine".
+    private static let maxHangRestarts = 3
+    /// Grace period between a SIGTERM and the SIGKILL backstop — shared by
+    /// the ordinary shutdown() path and the hang-recovery kill sequence.
+    private static let killGracePeriod: TimeInterval = 2
+
     private let daemonQueue = DispatchQueue(label: "com.vivotype.daemon", qos: .userInitiated)
 
     /// A hung transcription (MLX stall, pathological input) must not leave the
@@ -47,6 +83,14 @@ final class DaemonClient {
     /// runs as before — this hook exists so failures are visible, not silent.
     var onTranscribeError: ((String) -> Void)?
 
+    /// Called on the **main thread** when the daemon signals a structural
+    /// voice-editing command (currently only "scratch_that" — see
+    /// core/commands.py). Delivered AFTER that request's completion callback,
+    /// so Dictation's normal empty-text cleanup runs first. The reply also
+    /// resets the hang counters: a structural response is a healthy model
+    /// answer, not a daemon failure.
+    var onCommand: ((String) -> Void)?
+
     // MARK: lifecycle
 
     func start(pythonPath: String, repoRoot: String) {
@@ -55,8 +99,9 @@ final class DaemonClient {
         spawn()
     }
 
-    /// Launch the daemon process. Called from start() and again (at most once)
-    /// from handleEOF when the daemon dies unexpectedly.
+    /// Launch the daemon process. Called from start(), and again from
+    /// handleEOF() — once per crash (didAutoRestart, one-shot) and up to
+    /// maxHangRestarts times per hang-recovery cycle (independently budgeted).
     private func spawn() {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: pythonPath)
@@ -118,11 +163,24 @@ final class DaemonClient {
             guard let self = self, !self.didShutdown else { return }
             self.didShutdown = true
             self.sendJSON(["cmd": "shutdown"])
-            // Force-terminate after a grace period, serialized on daemonQueue so it
-            // can't race the stdout read/EOF handlers (which also hop onto this queue).
-            self.daemonQueue.asyncAfter(deadline: .now() + 2) { [weak self] in
-                self?.process?.terminate()
+            // Grace for a clean JSON shutdown, then the same SIGTERM→SIGKILL
+            // backstop hang recovery uses — a wedged MLX call ignores SIGTERM.
+            let oldProc = self.process
+            self.daemonQueue.asyncAfter(deadline: .now() + Self.killGracePeriod) {
+                Self.scheduleForceKill(oldProc)
             }
+        }
+    }
+
+    /// SIGTERM now; SIGKILL after killGracePeriod if still alive.
+    /// `oldProc` is captured independently of any DaemonClient so quit/restart
+    /// during the grace window cannot leave an orphan wedged Python process.
+    private static func scheduleForceKill(_ oldProc: Process?) {
+        oldProc?.terminate()
+        let grace = DaemonClient.killGracePeriod
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + grace) {
+            guard oldProc?.isRunning == true else { return }
+            kill(oldProc!.processIdentifier, SIGKILL)
         }
     }
 
@@ -149,7 +207,10 @@ final class DaemonClient {
 
     /// Submit a WAV for transcription. `completion` is always called on the main thread.
     /// Returns nil immediately if the daemon is not yet ready (caller falls back to CLI).
-    func transcribe(wav: URL, initialPrompt: String, completion: @escaping (String?) -> Void) {
+    /// `profile` selects per-app post-processing rules (core/postprocess_config.json
+    /// "profiles"); unknown names degrade to default rules daemon-side.
+    func transcribe(wav: URL, initialPrompt: String, profile: String = "default",
+                    completion: @escaping (String?) -> Void) {
         daemonQueue.async { [weak self] in
             guard let self = self, self.isReady else {
                 DispatchQueue.main.async { completion(nil) }
@@ -158,7 +219,8 @@ final class DaemonClient {
             let id = self.nextId; self.nextId += 1
             self.pendingCallbacks[id] = completion
             self.sendJSON(["id": id, "wav": wav.path,
-                           "initial_prompt": initialPrompt, "raw": false])
+                           "initial_prompt": initialPrompt, "raw": false,
+                           "profile": profile])
             // Watchdog: if the daemon hasn't answered by then, fail this request
             // over to the CLI. A reply arriving later finds no pending callback
             // and is dropped harmlessly (handleMessage's removeValue).
@@ -171,6 +233,7 @@ final class DaemonClient {
                     ecb?("transcription timed out")
                     cb(nil)
                 }
+                self.noteFailure()
             }
         }
     }
@@ -214,6 +277,13 @@ final class DaemonClient {
     private func handleMessage(_ obj: [String: Any]) {
         // Called on daemonQueue; UI callbacks are dispatched to main.
         if let statusStr = obj["status"] as? String {
+            // Once we've decided to kill this process (restartAfterHang set
+            // expectingHangRestart), ignore anything further it says — it may
+            // still emit a straggling status line before the SIGTERM/SIGKILL
+            // actually lands, and accepting it (e.g. a stale "ready") would
+            // flip isReady true for a process that's already being torn down.
+            // The real status arrives after handleEOF respawns a fresh one.
+            guard !expectingHangRestart else { return }
             let status: DaemonStatus
             switch statusStr {
             case "loading":
@@ -234,7 +304,23 @@ final class DaemonClient {
 
         } else if let id = obj["id"] as? Int,
                   let cb = pendingCallbacks.removeValue(forKey: id) {
-            if let text = obj["text"] as? String {
+            if obj["command"] as? String == "scratch_that" {
+                // Structural voice-edit command (exact match only — anything
+                // else falls through to normal text handling). Empty text via
+                // cb runs Dictation's standard finish/cleanup; the command is
+                // then delivered for execution. removeValue above is the
+                // single ticket, so neither path can run twice.
+                consecutiveFailures = 0
+                let commandCallback = onCommand
+                DispatchQueue.main.async {
+                    cb("")
+                    commandCallback?("scratch_that")
+                }
+            } else if let text = obj["text"] as? String {
+                // Only an actual transcription proves the daemon is healthy —
+                // an error reply does not (see the else branch: a daemon that
+                // stays alive but errors on every request is still failing).
+                consecutiveFailures = 0
                 DispatchQueue.main.async { cb(text) }
             } else {
                 // Per-request failure ({"id":N,"error":...}) — previously this
@@ -246,6 +332,10 @@ final class DaemonClient {
                     ecb?(message)
                     cb(nil)  // nil → caller's one-shot CLI fallback still runs
                 }
+                // A daemon that's alive and replies promptly but always with
+                // an error (e.g. a corrupted model) is just as broken as one
+                // that never replies — count it the same way a timeout is.
+                noteFailure()
             }
         }
     }
@@ -260,6 +350,28 @@ final class DaemonClient {
         // In-flight requests fail over to the one-shot CLI either way.
         DispatchQueue.main.async { for c in callbacks.values { c(nil) } }
 
+        // A deliberate hang-kill (restartAfterHang) drives its own respawn,
+        // separate from the crash-restart budget below — a hang and a crash
+        // are different failure signatures and shouldn't consume each other's
+        // one-shot guard.
+        if expectingHangRestart {
+            expectingHangRestart = false
+            // If shutdown() was requested (quit / restartBackend) while the
+            // hang-kill's SIGTERM-to-SIGKILL window was still in flight, honor
+            // it — don't spawn a fresh daemon during/after intentional exit.
+            guard !didShutdown else { return }
+            warn("VivoType: hung daemon respawned (attempt \(hangRestartCount)/\(Self.maxHangRestarts)).")
+            respawnFreshDaemon(statusCallback: cb)
+            return
+        }
+
+        // Hang budget exhausted: we already force-killed and told the UI —
+        // do not crash-respawn a daemon we've abandoned.
+        if abandonProcess {
+            abandonProcess = false
+            return
+        }
+
         // Unexpected death (not a requested shutdown): respawn ONCE so the
         // model reloads and dictation stays warm; the traceback is already in
         // daemon.log. A second death gives up — the CLI fallback keeps
@@ -267,13 +379,63 @@ final class DaemonClient {
         // spin forever.
         if !didShutdown && !didAutoRestart {
             didAutoRestart = true
-            lineBuffer.removeAll()
+            // The new process shares nothing with the one that just crashed —
+            // stale hang-detection state from its lifetime must not carry over
+            // and prematurely force-kill an otherwise-healthy fresh daemon.
+            consecutiveFailures = 0
             warn("VivoType: daemon died unexpectedly — restarting once (see daemon.log)")
-            DispatchQueue.main.async { cb?(.loading(nil)) }
-            spawn()
+            respawnFreshDaemon(statusCallback: cb)
             return
         }
         DispatchQueue.main.async { cb?(.error("daemon terminated")) }
+    }
+
+    /// Shared final step for both respawn paths above: clear the read
+    /// buffer, tell the UI a fresh model load is starting, then spawn().
+    private func respawnFreshDaemon(statusCallback cb: ((DaemonStatus) -> Void)?) {
+        lineBuffer.removeAll()
+        DispatchQueue.main.async { cb?(.loading(nil)) }
+        spawn()
+    }
+
+    /// Register one failed request (timeout or per-request error). Two in a
+    /// row with no success in between means the process itself is wedged —
+    /// distinct from a hard crash, which handleEOF detects separately.
+    private func noteFailure() {
+        // Called on daemonQueue.
+        consecutiveFailures += 1
+        if consecutiveFailures >= Self.hangTimeoutThreshold
+            && !didShutdown && !expectingHangRestart {
+            restartAfterHang()
+        }
+    }
+
+    /// The daemon process is alive but has stopped answering requests (two
+    /// consecutive failures). Force-kill it and let the resulting stdout EOF
+    /// drive the respawn via handleEOF — reusing that single spawn point
+    /// avoids the stale-EOF race restartBackend() (App.swift) already guards
+    /// against, since the old client's callbacks stay wired throughout.
+    private func restartAfterHang() {
+        // Called on daemonQueue.
+        guard hangRestartCount < Self.maxHangRestarts else {
+            // Giving up doesn't mean the daemon became healthy — it's still
+            // wedged. Kill it so GPU/RAM are released; abandonProcess stops
+            // handleEOF from crash-respawning. CLI fallback stays active.
+            warn("VivoType: daemon hung \(hangRestartCount)x — giving up auto-restart; CLI fallback stays active.")
+            isReady = false
+            abandonProcess = true
+            let oldProc = process
+            Self.scheduleForceKill(oldProc)
+            let cb = onStatusChange
+            DispatchQueue.main.async { cb?(.error("daemon repeatedly hung — restart manually")) }
+            return
+        }
+        hangRestartCount += 1
+        consecutiveFailures = 0
+        expectingHangRestart = true
+        isReady = false  // new requests short-circuit to CLI until the respawn is ready
+        warn("VivoType: daemon appears hung — force-restarting (attempt \(hangRestartCount)/\(Self.maxHangRestarts)).")
+        Self.scheduleForceKill(process)
     }
 
     private func sendJSON(_ obj: [String: Any]) {

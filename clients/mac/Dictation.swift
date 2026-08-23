@@ -5,6 +5,7 @@
 import Foundation
 import AVFoundation
 import AppKit
+import Carbon.HIToolbox
 import CoreGraphics
 import ApplicationServices
 
@@ -40,6 +41,18 @@ final class Dictation {
     /// Called on the main thread when a clipboard correction is logged (count >= 1).
     var onCaptured: ((Int) -> Void)?
 
+    /// Called on the main thread when injection was blocked (secure field, or
+    /// Accessibility denied) and the text was placed on the clipboard instead.
+    var onInjectBlocked: ((String) -> Void)?
+
+    /// Called on the main thread when capture was cancelled because the input
+    /// device changed mid-dictation and the captured audio was discarded.
+    var onCaptureLost: ((String) -> Void)?
+
+    /// Called on the main thread after text was successfully injected (typed or
+    /// pasted). Used by first-run practice to detect a successful guided rep.
+    var onInjected: ((String) -> Void)?
+
     /// Whether the "Pop" sound plays on a captured correction (Settings toggle).
     var soundEnabled = true
 
@@ -50,6 +63,27 @@ final class Dictation {
     private var lastSeenChangeCount = NSPasteboard.general.changeCount
     private var clipboardTimer: Timer?
     private var configObserver: NSObjectProtocol?
+
+    // MARK: scratch-that history
+    // Bounded stack of keyboard-injected spans ("scratch that" deletes the
+    // newest). Only successful typeUnicode landings are recorded — clipboard
+    // parks (AX denied / secure field) and browser pastes never become
+    // deletable history, so a command can never fire Delete at text VivoType
+    // didn't type itself. Depth 3 + 120 s TTL mirror the learning window.
+    private struct ScratchRecord {
+        let text: String
+        /// Grapheme-cluster count — Cocoa text views delete one cluster per
+        /// Backspace press, so this (not utf16.count) is the correct budget:
+        /// Devanagari combining marks are several UTF-16 units but ONE cluster,
+        /// and a unit-based count would over-delete into the user's own words.
+        let deletePresses: Int
+        let bundleID: String?
+        let date: Date
+    }
+    private var scratchHistory: [ScratchRecord] = []  // newest last
+    private static let scratchHistoryLimit = 3
+    private static let scratchMaxPresses = 2_000
+    private static let scratchChunkSize = 256
 
     // Focused apps where synthetic keystrokes are unreliable -> use paste.
     private static let browserBundleIDs: Set<String> = [
@@ -238,6 +272,138 @@ final class Dictation {
         warn("VivoType: audio configuration changed — recording cancelled.")
         cancelRecording()
         onState?(.error)
+        // Not gated on toastEnabled (same reasoning as onInjectBlocked): losing
+        // spoken words silently is precisely the failure this surfaces.
+        onCaptureLost?("Mic changed — that dictation was lost. Try again")
+    }
+
+    // MARK: voice-editing commands
+
+    /// Best-effort read of the focused element via Accessibility. Returns nil
+    /// when the app doesn't expose AX (canvas tools, some terminals) —
+    /// executeCommand then proceeds on its remaining guards; that residual is
+    /// stated inline at guard 7 below.
+    private func focusedElement() -> AXUIElement? {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focused: CFTypeRef?
+        let focusError = AXUIElementCopyAttributeValue(systemWide,
+                                                       kAXFocusedUIElementAttribute as CFString,
+                                                       &focused)
+        guard focusError == .success, focused != nil else { return nil }
+        // CF types don't support conditional downcasts; the API guarantees
+        // kAXFocusedUIElementAttribute yields an AXUIElement.
+        return focused as! AXUIElement
+    }
+
+    /// Best-effort read of the focused element's text value, or nil when the
+    /// app doesn't expose it.
+    private func focusedElementValue() -> String? {
+        guard let element = focusedElement() else { return nil }
+        var value: CFTypeRef?
+        let valueError = AXUIElementCopyAttributeValue(element,
+                                                       kAXValueAttribute as CFString,
+                                                       &value)
+        guard valueError == .success else { return nil }
+        return value as? String
+    }
+
+    /// Executes a structural voice-edit command signaled by the daemon
+    /// (currently only "scratch_that"). Destructive by nature, so every guard
+    /// failure shows a toast and sends ZERO key events — it fails toward
+    /// doing nothing.
+    func executeCommand(_ name: String) {
+        guard name == "scratch_that" else { return }
+
+        func refuse(_ reason: String) {
+            warn("VivoType: scratch refused — \(reason)")
+            onInjectBlocked?(reason)
+        }
+
+        // 1. History exists and is fresh (TTL mirrors correction learning).
+        guard let record = scratchHistory.last else {
+            return refuse("Nothing recent to delete")
+        }
+        guard Date().timeIntervalSince(record.date) < 120 else {
+            _ = scratchHistory.popLast()
+            return refuse("That dictation is too old to delete")
+        }
+        // 2. A password field must never receive Delete keyevents even though
+        //    the original dictation landed somewhere else entirely.
+        guard !IsSecureEventInputEnabled() else {
+            return refuse("Can't delete inside a password field")
+        }
+        // 3. Same app as when the text landed (app-switch race). Strict
+        //    compare: a nil bundle on either side refuses.
+        guard let frontBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+              frontBundle == record.bundleID
+        else {
+            return refuse("Switched apps since dictating — not deleting")
+        }
+        // 4. v1 scope: browsers excluded — focus outside an editable field can
+        //    turn synthetic Delete into page navigation in embedded webviews.
+        guard !Dictation.browserBundleIDs.contains(frontBundle) else {
+            return refuse("Editing commands aren't available in this app yet.")
+        }
+        // 5. Deleting needs Accessibility just like typing did.
+        guard AXIsProcessTrusted() else {
+            return refuse("Accessibility needed — can't delete")
+        }
+        // 6. Bound the blast radius of a hallucinated phrase.
+        guard record.deletePresses <= Self.scratchMaxPresses else {
+            return refuse("That dictation is too long to delete")
+        }
+        // 7. Best-effort content check: if the app exposes its text via
+        //    Accessibility, our span must still be present where we left it.
+        //    Documented residuals: (a) apps WITHOUT AX text attributes
+        //    (canvas tools, some terminals) proceed on guards 1-6; (b) this
+        //    checks presence anywhere in the element, not caret position.
+        //    We also capture the focused ELEMENT's identity so the mid-burst
+        //    re-checks below can catch a same-app field switch, which a
+        //    bundle check alone cannot see.
+        let startElement = focusedElement()
+        if let value = focusedElementValue(), !value.contains(record.text) {
+            return refuse("Couldn't verify the dictated text — not deleting")
+        }
+        if let value = focusedElementValue(), !value.contains(record.text) {
+            return refuse("Couldn't verify the dictated text — not deleting")
+        }
+
+        // Consume the record BEFORE any keyevents: a ⌘C during the burst must
+        // not teach the just-deleted span as a "correction", and successive
+        // scratches target the next-older entry. This span leaves the
+        // correction-learning window too.
+        scratchHistory.removeLast()
+        if lastInjected == record.text {
+            lastInjected = nil
+            lastInjectedAt = Date(timeIntervalSince1970: 0)
+        }
+
+        // Chunked deletion with focus re-verified between chunks: ⌘-tabbing
+        // mid-burst stops the stream after at most one chunk lands elsewhere,
+        // and so does clicking into a DIFFERENT field of the same app (the
+        // focused element's identity changes — a bundle check can't see it).
+        let source = CGEventSource(stateID: .combinedSessionState)
+        var sent = 0
+        while sent < record.deletePresses {
+            let currentElement = focusedElement()
+            guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == frontBundle,
+                  !IsSecureEventInputEnabled(),
+                  startElement == nil || currentElement == nil
+                      || CFEqual(startElement, currentElement)
+            else { return refuse("Focus moved mid-delete — stopped early") }
+            let chunkEnd = min(sent + Self.scratchChunkSize, record.deletePresses)
+            while sent < chunkEnd {
+                guard let down = CGEvent(keyboardEventSource: source,
+                                         virtualKey: CGKeyCode(kVK_Delete), keyDown: true),
+                      let up = CGEvent(keyboardEventSource: source,
+                                       virtualKey: CGKeyCode(kVK_Delete), keyDown: false)
+                else { return refuse("Could not synthesize the delete keys") }
+                down.post(tap: .cghidEventTap)
+                up.post(tap: .cghidEventTap)
+                sent += 1
+            }
+        }
+        warn("VivoType: scratched \(record.deletePresses) characters.")
     }
 
     // MARK: core/ CLI bridge
@@ -258,23 +424,72 @@ final class Dictation {
     private func inject(_ text: String) {
         lastInjected = text
         lastInjectedAt = Date()
-        
-        // Both injection methods require Accessibility permissions.
+
+        // Typing and synthetic ⌘V both need Accessibility. Without it, park the
+        // transcript as a normal pasteboard string so the user can ⌘V themselves —
+        // no fragile workarounds. Toast (via onInjectBlocked) is the only UX;
+        // do not set .error (finish() would immediately overwrite it with .idle).
         guard AXIsProcessTrusted() else {
-            warn("VivoType: Cannot inject text. Accessibility permissions are missing.")
-            onState?(.error)
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+            lastSeenChangeCount = pasteboard.changeCount  // our write, not a correction
+            warn("VivoType: Accessibility missing — text copied to the clipboard.")
+            onInjectBlocked?("Accessibility needed — text copied, press ⌘V to paste")
             return
         }
 
-        let frontBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
-        if Dictation.browserBundleIDs.contains(frontBundle) {
-            pasteViaClipboard(text)
-        } else {
-            typeUnicode(text)
+        // A password field (or any app holding secure event input) swallows
+        // synthetic keystrokes AND ⌘V silently — the text would just vanish.
+        // Park it on the clipboard instead so nothing is lost, and say so.
+        if IsSecureEventInputEnabled() {
+            // Secure input strongly implies a password: it must never enter the
+            // correction-learning pipeline (argv of a child process + a
+            // plaintext log on disk), so forget it as "last injected" text.
+            lastInjected = nil
+            lastInjectedAt = Date(timeIntervalSince1970: 0)
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            // Concealed-type marker: well-behaved clipboard managers skip it.
+            pasteboard.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
+            pasteboard.setString(text, forType: .string)
+            lastSeenChangeCount = pasteboard.changeCount  // our write, not a correction
+            let parkedCount = pasteboard.changeCount
+            // Don't leave likely-secret text on the clipboard forever: clear it
+            // after 60 s unless the user has copied something else since.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+                let pb = NSPasteboard.general
+                guard pb.changeCount == parkedCount else { return }
+                pb.clearContents()
+                self?.lastSeenChangeCount = pb.changeCount
+            }
+            warn("VivoType: secure input is active — text copied to the clipboard instead.")
+            onInjectBlocked?("Secure field — text copied, press ⌘V to paste")
+            return
         }
+
+        let frontBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        if Dictation.browserBundleIDs.contains(frontBundle ?? "") {
+            pasteViaClipboard(text)
+        } else if typeUnicode(text), !text.isEmpty {
+            // Only a fully typed landing becomes scratchable history.
+            scratchHistory.append(ScratchRecord(text: text,
+                                                deletePresses: text.count,
+                                                bundleID: frontBundle,
+                                                date: Date()))
+            if scratchHistory.count > Self.scratchHistoryLimit {
+                scratchHistory.removeFirst()
+            }
+        }
+        onInjected?(text)
     }
 
-    private func typeUnicode(_ text: String) {
+    /// Types text via synthetic keyboard events. Returns false if event
+    /// creation failed mid-way (partial landing — callers must not record it
+    /// as scratchable history). Delete events elsewhere deliberately do NOT
+    /// reuse this pattern: they carry no unicode payload.
+    @discardableResult
+    private func typeUnicode(_ text: String) -> Bool {
         let source = CGEventSource(stateID: .combinedSessionState)
         let scalars = Array(text.utf16)
         let chunkSize = 16  // a single long unicode event is dropped/garbled by some apps
@@ -283,7 +498,7 @@ final class Dictation {
             let chunk = Array(scalars[index..<min(index + chunkSize, scalars.count)])
             guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
                   let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
-            else { return }
+            else { return false }
             chunk.withUnsafeBufferPointer { ptr in
                 down.keyboardSetUnicodeString(stringLength: ptr.count, unicodeString: ptr.baseAddress)
                 up.keyboardSetUnicodeString(stringLength: ptr.count, unicodeString: ptr.baseAddress)
@@ -292,6 +507,7 @@ final class Dictation {
             up.post(tap: .cghidEventTap)
             index += chunkSize
         }
+        return true
     }
 
     private func pasteViaClipboard(_ text: String) {

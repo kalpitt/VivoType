@@ -37,16 +37,18 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 # directly (python core/cli.py) or as a module (python -m core.cli).
 try:
     from core.postprocess import load_config, postprocess
+    from core.commands import apply_transform, detect_command
     from core.config import load_settings
-    from core.audioio import load_wav
+    from core.audioio import has_speech, load_wav
     from core import asr
-    from core.asr import speech_segments
+    from core.asr import is_prompt_echo, speech_segments
 except ImportError:
     from postprocess import load_config, postprocess
+    from commands import apply_transform, detect_command
     from config import load_settings
-    from audioio import load_wav
+    from audioio import has_speech, load_wav
     import asr
-    from asr import speech_segments
+    from asr import is_prompt_echo, speech_segments
 
 
 def _eprint(message: str) -> None:
@@ -64,10 +66,13 @@ def load_audio(path: Path):
     return load_wav(path)
 
 
-def transcribe(audio, model_name: str):
+def transcribe(audio, model_name: str, initial_prompt: str = ""):
     """Run MLX Whisper on the Apple Silicon GPU and return the segment list."""
     model = asr.load_model(model_name)
-    segments, _info = model.transcribe(audio)
+    kwargs: dict = {}
+    if initial_prompt:
+        kwargs["initial_prompt"] = initial_prompt
+    segments, _info = model.transcribe(audio, **kwargs)
     return list(segments)
 
 
@@ -99,6 +104,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Disable Indic post-processing (filler removal, dictionary, currency).",
     )
+    parser.add_argument(
+        "--profile",
+        default="default",
+        help="Post-processing profile name from postprocess_config.json "
+             "'profiles' (per-app contexts). Unknown names fall back to the "
+             "default rules. Mirrors the daemon's 'profile' request field.",
+    )
+    parser.add_argument(
+        "--initial-prompt",
+        default="",
+        help="Vocabulary hint passed to Whisper (same as the daemon's "
+             "initial_prompt). Also used to drop prompt-echo hallucinations.",
+    )
     args = parser.parse_args(argv)
 
     audio_path = Path(args.audio)
@@ -115,9 +133,16 @@ def main(argv: list[str] | None = None) -> int:
         _eprint(f"Error: could not read audio '{audio_path}': {exc}")
         return 1
 
+    # Silence gate: Whisper hallucinates on silence (prompt echoes, word
+    # loops), so a silent clip prints nothing and exits cleanly. Raw mode
+    # skips the gate so it stays a true diagnostic window into the model.
+    if not args.raw and not has_speech(audio):
+        print("")
+        return 0
+
     model_name = args.model or load_settings().get("model", "small.en")
     try:
-        segments = transcribe(audio, model_name)
+        segments = transcribe(audio, model_name, initial_prompt=args.initial_prompt)
     except Exception as exc:
         _eprint(f"Error: transcription failed: {exc}")
         return 1
@@ -136,13 +161,51 @@ def main(argv: list[str] | None = None) -> int:
             print(line)
     else:
         # Drop non-speech segments (silence echoes the initial_prompt) first.
-        text = " ".join(seg.text.strip() for seg in speech_segments(segments)).strip()
+        text = " ".join(
+            t for seg in speech_segments(segments) if (t := seg.text.strip())
+        ).strip()
+        # Command detection mirrors the daemon exactly: raw ASR before
+        # cleanup, transforms after. One structural difference — the one-shot
+        # CLI has no channel to ask Swift to delete previous dictation, so a
+        # standalone "scratch that" degrades to a no-op (nothing typed)
+        # instead of landing in the document as literal words.
+        raw_asr = text
+        pp_config = None
         if not args.no_clean:
             try:
-                text = postprocess(text, load_config(args.config))
+                pp_config = load_config(args.config)
             except Exception as exc:
-                _eprint(f"Error: post-processing failed: {exc}")
-                return 1
+                _eprint(f"Warning: post-processing config failed ({exc}); returning raw ASR text")
+        signal, remaining, transform = None, text, "none"
+        if pp_config is not None:
+            try:
+                signal, remaining, transform = detect_command(
+                    remaining, leading_fillers=pp_config.get("fillers"))
+            except Exception as exc:
+                _eprint(f"Warning: command detection failed ({exc}); treating as dictation")
+        if signal == "scratch_that":
+            _eprint("Warning: 'scratch that' over the standalone CLI cannot "
+                    "delete earlier dictation; ignored.")
+            print("")
+            return 0
+        text = remaining
+        if pp_config is not None:
+            try:
+                text = postprocess(remaining, pp_config, profile=args.profile)
+            except Exception as exc:
+                # Match the daemon: keep the transcript, don't fail the CLI
+                # fallback path on a bad dictionary rule.
+                _eprint(f"Warning: post-processing failed ({exc}); returning raw ASR text")
+                text = remaining
+            else:
+                try:
+                    text = apply_transform(text, transform)
+                except Exception as exc:
+                    _eprint(f"Warning: command transform failed ({exc}); returning cleaned text")
+        # Echo guard after cleanup so filler-prefixed echoes still drop
+        # (same order the daemon reliability path aims for).
+        if is_prompt_echo(text, args.initial_prompt):
+            text = ""
         print(text)
 
     return 0

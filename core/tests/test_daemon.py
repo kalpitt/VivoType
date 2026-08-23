@@ -1,8 +1,10 @@
 """Tests for core/daemon.py — no model download required (mock patching)."""
 from __future__ import annotations
 
+import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -13,6 +15,8 @@ from unittest import mock
 import numpy as np
 
 import core.daemon as daemon
+
+_OMITTED = object()  # sentinel: build the request WITHOUT a "profile" field
 
 
 # ---------------------------------------------------------------------------
@@ -28,9 +32,14 @@ class _FakeSeg:
         self.no_speech_prob = no_speech_prob
 
 
-def _make_wav(path: Path, samplerate: int = 16000, duration: float = 0.1) -> None:
-    """Write a minimal silent WAV for path-existence checks."""
-    pcm = np.zeros(int(samplerate * duration), dtype=np.int16)
+def _make_wav(path: Path, samplerate: int = 16000, duration: float = 0.1,
+              amplitude: float = 0.1) -> None:
+    """Write a minimal WAV carrying a speech-level tone (so the silence gate
+    passes); use amplitude=0.0 to write true silence."""
+    n = int(samplerate * duration)
+    t = np.arange(n, dtype=np.float64) / samplerate
+    tone = amplitude * np.sin(2 * np.pi * 220 * t)
+    pcm = np.clip(tone * 32768.0, -32768, 32767).astype(np.int16)
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
@@ -111,12 +120,11 @@ class BootTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class PreProtocolCrashTests(unittest.TestCase):
-    """A crash before the boot sequence even starts (corrupt config.json or
-    postprocess config) must surface as an NDJSON error, not a bare traceback
-    the Swift client can't see (stdout carries no bytes; stderr is discarded
-    pre-fix / logged post-fix, but either way the app just sees "terminated")."""
+    """Unexpected raises from load_settings / load_config (not corrupt JSON —
+    those loaders swallow decode errors and return defaults) must still surface
+    as an NDJSON error, not a bare traceback the Swift client can't see."""
 
-    def test_corrupt_settings_emits_error_and_exits(self):
+    def test_settings_load_raise_emits_error_and_exits(self):
         out_buf = io.StringIO()
         with mock.patch("core.daemon.load_settings", side_effect=ValueError("bad json")), \
              mock.patch("sys.stdin", io.StringIO("")), \
@@ -130,7 +138,7 @@ class PreProtocolCrashTests(unittest.TestCase):
         self.assertEqual(msgs[0]["status"], "error")
         self.assertIn("bad json", msgs[0]["error"])
 
-    def test_corrupt_postprocess_config_emits_error_and_exits(self):
+    def test_postprocess_config_load_raise_emits_error_and_exits(self):
         out_buf = io.StringIO()
         with mock.patch("core.daemon.load_config", side_effect=ValueError("bad pp config")), \
              mock.patch("sys.stdin", io.StringIO("")), \
@@ -403,6 +411,30 @@ class TranscribeUnitTests(unittest.TestCase):
         self.assertIn("error", result)
         self.assertNotIn("text", result)
 
+    def test_silent_clip_returns_empty_text_without_calling_model(self):
+        # The silence gate must answer BEFORE Whisper runs: a silent clip can
+        # only hallucinate (prompt echo, word loops), so the model is never
+        # invoked and nothing is inserted.
+        model = mock.Mock()
+        with tempfile.TemporaryDirectory() as d:
+            wav = str(Path(d) / "quiet.wav")
+            _make_wav(Path(wav), amplitude=0.0)
+            result = daemon._transcribe(model, wav, "VivoType, menu", False, self._pp())
+        self.assertEqual(result["text"], "")
+        model.transcribe.assert_not_called()
+
+    def test_silent_clip_in_raw_mode_still_calls_model(self):
+        # Raw mode is the diagnostic window — the gate must not hide what the
+        # model would have produced.
+        model = mock.Mock()
+        model.transcribe.return_value = ([_FakeSeg(" VivoType")], None)
+        with tempfile.TemporaryDirectory() as d:
+            wav = str(Path(d) / "quiet.wav")
+            _make_wav(Path(wav), amplitude=0.0)
+            result = daemon._transcribe(model, wav, "", True, self._pp())
+        model.transcribe.assert_called_once()
+        self.assertIn("text", result)
+
     def test_no_speech_segments_yield_empty_text(self):
         # Silence makes Whisper echo the initial_prompt with a high no_speech_prob;
         # such segments must be dropped so nothing is inserted.
@@ -413,6 +445,79 @@ class TranscribeUnitTests(unittest.TestCase):
             _make_wav(Path(wav))
             result = daemon._transcribe(model, wav, "VivoType", False, self._pp())
         self.assertEqual(result["text"], "")
+
+    def test_prompt_echo_with_low_no_speech_prob_is_dropped(self):
+        # The dangerous variant: Whisper echoes the whole vocabulary hint back
+        # CONFIDENTLY (low no_speech_prob), sailing past speech_segments().
+        # The transcript being exactly the prompt is the tell.
+        model = mock.Mock()
+        model.transcribe.return_value = (
+            [_FakeSeg(" VivoType, menu", no_speech_prob=0.1)], None)
+        with tempfile.TemporaryDirectory() as d:
+            wav = str(Path(d) / "x.wav")
+            _make_wav(Path(wav))
+            result = daemon._transcribe(model, wav, "VivoType, menu", False, self._pp())
+        self.assertEqual(result["text"], "")
+
+    def test_filler_prefixed_prompt_echo_is_dropped(self):
+        # Whisper often prefixes a filler before echoing the hint. The echo
+        # guard runs after postprocess so "um …" still collapses to the prompt
+        # and is dropped instead of being inserted.
+        model = mock.Mock()
+        model.transcribe.return_value = (
+            [_FakeSeg(" um VivoType, menu", no_speech_prob=0.1)], None)
+        with tempfile.TemporaryDirectory() as d:
+            wav = str(Path(d) / "x.wav")
+            _make_wav(Path(wav))
+            result = daemon._transcribe(model, wav, "VivoType, menu", False, self._pp())
+        self.assertEqual(result["text"], "")
+
+    def test_filler_suffixed_prompt_echo_is_dropped(self):
+        model = mock.Mock()
+        model.transcribe.return_value = (
+            [_FakeSeg(" VivoType, menu um", no_speech_prob=0.1)], None)
+        with tempfile.TemporaryDirectory() as d:
+            wav = str(Path(d) / "x.wav")
+            _make_wav(Path(wav))
+            result = daemon._transcribe(model, wav, "VivoType, menu", False, self._pp())
+        self.assertEqual(result["text"], "")
+
+    def test_doubled_prompt_echo_is_dropped(self):
+        # Loop variant: the prompt echoed twice back-to-back must not slip
+        # past the guard (token-multiple check) — collapse_repetitions only
+        # fires at 3+ repeats, so the echo guard has to catch 2x itself.
+        model = mock.Mock()
+        model.transcribe.return_value = (
+            [_FakeSeg(" VivoType, menu VivoType, menu", no_speech_prob=0.1)], None)
+        with tempfile.TemporaryDirectory() as d:
+            wav = str(Path(d) / "x.wav")
+            _make_wav(Path(wav))
+            result = daemon._transcribe(model, wav, "VivoType, menu", False, self._pp())
+        self.assertEqual(result["text"], "")
+
+    def test_postprocess_failure_returns_raw_asr(self):
+        # A broken dictionary rule must not drop the transcript.
+        model = mock.Mock()
+        model.transcribe.return_value = (
+            [_FakeSeg(" hello world", no_speech_prob=0.05)], None)
+        with tempfile.TemporaryDirectory() as d:
+            wav = str(Path(d) / "x.wav")
+            _make_wav(Path(wav))
+            with mock.patch("core.daemon.postprocess", side_effect=RuntimeError("bad regex")):
+                result = daemon._transcribe(model, wav, "", False, self._pp())
+        self.assertEqual(result["text"], "hello world")
+
+    def test_real_speech_containing_prompt_terms_is_kept(self):
+        # Dictation that merely CONTAINS prompt vocabulary must not be eaten.
+        model = mock.Mock()
+        model.transcribe.return_value = (
+            [_FakeSeg(" Open the menu in VivoType please", no_speech_prob=0.05)], None)
+        with tempfile.TemporaryDirectory() as d:
+            wav = str(Path(d) / "x.wav")
+            _make_wav(Path(wav))
+            result = daemon._transcribe(model, wav, "VivoType, menu", False, self._pp())
+        self.assertIn("menu", result["text"])
+        self.assertIn("VivoType", result["text"])
 
 
 class ModelLoadFailureIntegrationTests(unittest.TestCase):
@@ -560,6 +665,321 @@ class ConfigReloadTests(unittest.TestCase):
         texts = [m["text"] for m in msgs if "id" in m]
         self.assertEqual(texts[0], "blr")          # before the edit
         self.assertEqual(texts[1], "Bengaluru")    # after the live edit
+
+
+class ProfileThreadingTests(unittest.TestCase):
+    """The optional 'profile' request field must select post-processing rules:
+    omitted/non-string/unknown all behave exactly as 'default' (the gated IPC
+    surface), and the reply shape never changes."""
+
+    CFG = {
+        "fillers": ["um"],
+        "replacements": {},
+        "profiles": {
+            "code": {"convert_currency": False, "remove_fillers": False},
+        },
+    }
+
+    def _texts_for(self, *profile_fields):
+        """One request per argument; each argument is the raw 'profile' field
+        value to send, or _OMITTED to build the request without the field."""
+        model_mock = mock.Mock()
+        model_mock.transcribe.return_value = ([_FakeSeg(" that is $10k um")], None)
+
+        with tempfile.TemporaryDirectory() as d:
+            wav = Path(d) / "t.wav"
+            _make_wav(wav)
+            lines = []
+            for i, field in enumerate(profile_fields, start=1):
+                req = {"id": i, "wav": str(wav), "initial_prompt": "", "raw": False}
+                if field is not _OMITTED:
+                    req["profile"] = field
+                lines.append(json.dumps(req))
+            lines.append(json.dumps({"cmd": "shutdown"}))
+            out_buf = io.StringIO()
+            with mock.patch("core.daemon._load_model", return_value=model_mock), \
+                 mock.patch("core.daemon._is_model_cached", return_value=True), \
+                 mock.patch("core.daemon.load_config", return_value=self.CFG), \
+                 mock.patch("core.daemon.config_mtime", return_value=1.0), \
+                 mock.patch("sys.stdin", io.StringIO("\n".join(lines) + "\n")), \
+                 mock.patch("sys.stdout", out_buf):
+                daemon.main()
+
+        msgs = [json.loads(l) for l in out_buf.getvalue().splitlines() if l.strip()]
+        self.assertEqual(len([m for m in msgs if "id" in m]), len(profile_fields))
+        return [m["text"] for m in msgs if "id" in m]
+
+    def test_profile_selects_rules(self):
+        texts = self._texts_for("default", "code")
+        # Default: currency converted, filler stripped.
+        self.assertEqual(texts[0], "that is ₹10 lakh")
+        # Code context: both toggles off — dollars and "um" survive untouched.
+        self.assertEqual(texts[1], "that is $10k um")
+
+    def test_omitted_field_equals_explicit_default(self):
+        texts = self._texts_for(_OMITTED, "default")
+        self.assertEqual(texts[0], texts[1])
+
+    def test_non_string_and_empty_fields_coerce_to_default(self):
+        texts = self._texts_for("default", 5, "")
+        self.assertEqual(texts[0], texts[1])
+        self.assertEqual(texts[0], texts[2])
+
+    def test_unknown_profile_behaves_as_default(self):
+        # The real postprocess path warns once to stderr; behavior must not
+        # change and the reply shape stays {"id","text"}.
+        with contextlib.redirect_stderr(io.StringIO()):
+            texts = self._texts_for("default", "no-such-profile")
+        self.assertEqual(texts[0], texts[1])
+
+
+class ReloadFailureResilienceTests(unittest.TestCase):
+    """D4 hardening: a config reload that RAISES mid-request-loop (a wrong-typed
+    field slips past load_config's decode guards — e.g. {"fillers": 5} raises
+    TypeError) must not kill the daemon. Keep serving last-good rules; warn
+    once per distinct mtime, not once per request."""
+
+    def test_raising_reload_keeps_last_good_config_and_stays_alive(self):
+        with tempfile.TemporaryDirectory() as d:
+            wav = Path(d) / "t.wav"
+            _make_wav(wav)
+            model_mock = mock.Mock()
+            model_mock.transcribe.return_value = ([_FakeSeg(" blr")], None)
+            cfg_good = {"fillers": [], "replacements": {"blr": "Bengaluru"},
+                        "profiles": {}}
+            calls = {"n": 0}
+
+            def raising_reload():
+                # Boot + request 1 get the good config; every later reload
+                # attempt raises exactly like the real wrong-typed file does.
+                calls["n"] += 1
+                if calls["n"] >= 2:
+                    raise TypeError("'int' object is not iterable")
+                return dict(cfg_good)
+
+            reqs = [json.dumps({"id": i, "wav": str(wav), "initial_prompt": "",
+                                "raw": False}) for i in (1, 2, 3)]
+            err = io.StringIO()
+            # mtime timeline: boot baseline 7.0; req1 sees 7.0 (no reload); req2
+            # sees 9.0 -> reload raises; req3 sees 9.0 again -> retry, warn-once.
+            with mock.patch("core.daemon._load_model", return_value=model_mock), \
+                 mock.patch("core.daemon._is_model_cached", return_value=True), \
+                 mock.patch("core.daemon.load_config", side_effect=raising_reload), \
+                 mock.patch("core.daemon.config_mtime",
+                            side_effect=[7.0, 7.0, 9.0, 9.0, 9.0]), \
+                 mock.patch("sys.stdin", io.StringIO(
+                     "\n".join(reqs) + "\n" + json.dumps({"cmd": "shutdown"}) + "\n")), \
+                 mock.patch("sys.stdout", io.StringIO()) as out_buf, \
+                 contextlib.redirect_stderr(err):
+                daemon.main()
+
+            msgs = [json.loads(l) for l in out_buf.getvalue().splitlines() if l.strip()]
+
+        texts = [m["text"] for m in msgs if "id" in m]
+        self.assertEqual([m.get("error") for m in msgs if "id" in m],
+                         [None, None, None])      # no error replies anywhere
+        self.assertEqual(len(texts), 3)           # daemon alive throughout
+        self.assertEqual(texts[0], "Bengaluru")   # good rules before the edit
+        self.assertEqual(texts[1], "Bengaluru")   # last-good kept after raise
+        self.assertEqual(texts[2], "Bengaluru")   # still serving on retry
+        self.assertEqual(err.getvalue().count("config reload failed"), 1)
+        self.assertEqual(calls["n"], 3)           # boot + two reload attempts
+
+    def test_wrong_typed_config_file_raises_through_real_loader(self):
+        # End-to-end proof of the premise above: a REAL load_config against a
+        # {"fillers": 5} file raises TypeError (decode guards don't catch it),
+        # and the daemon's reload guard absorbs it mid-loop instead of dying.
+        model_mock = mock.Mock()
+        model_mock.transcribe.return_value = ([_FakeSeg(" blr")], None)
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / "pp.json"
+            base.write_text(json.dumps(
+                {"fillers": [], "replacements": {"blr": "Bengaluru"}}),
+                encoding="utf-8")
+            wav = Path(d) / "t.wav"
+            _make_wav(wav)
+            reqs = [json.dumps({"id": i, "wav": str(wav),
+                                "initial_prompt": "", "raw": False})
+                    for i in (1, 2)]
+            err = io.StringIO()
+            state = {"call": 0}
+
+            def fake_mtime(*a, **k):
+                # boot=7.0; req1=7.0 (no reload); req2: corrupt the file to a
+                # wrong-typed field FIRST, then report the new mtime so the
+                # loop attempts a reload against the real (raising) loader.
+                state["call"] += 1
+                if state["call"] == 3:
+                    base.write_text(json.dumps({"fillers": 5}), encoding="utf-8")
+                    mtime = base.stat().st_mtime
+                    os.utime(base, (mtime + 10, mtime + 10))
+                return base.stat().st_mtime
+
+            with mock.patch("core.postprocess.DEFAULT_CONFIG_PATH", base), \
+                 mock.patch("core.postprocess.USER_DICT_PATH",
+                            Path(d) / "no-overlay.json"), \
+                 mock.patch("core.daemon._load_model", return_value=model_mock), \
+                 mock.patch("core.daemon._is_model_cached", return_value=True), \
+                 mock.patch("core.daemon.config_mtime", side_effect=fake_mtime), \
+                 mock.patch("sys.stdin", io.StringIO(
+                     "\n".join(reqs) + "\n"
+                     + json.dumps({"cmd": "shutdown"}) + "\n")), \
+                 mock.patch("sys.stdout", io.StringIO()) as out_buf, \
+                 contextlib.redirect_stderr(err):
+                daemon.main()
+
+        msgs = [json.loads(l) for l in out_buf.getvalue().splitlines() if l.strip()]
+        texts = [m["text"] for m in msgs if "id" in m]
+        self.assertEqual(texts, ["Bengaluru", "Bengaluru"])  # alive, last-good
+        self.assertIn("config reload failed", err.getvalue())
+
+
+class VoiceCommandTests(unittest.TestCase):
+    """Feature 4: literal command phrases. Scratch returns the structural
+    signal; transforms apply AFTER postprocess; every normal/silent/raw reply
+    carries "command" (null); error replies never do."""
+
+    def _msgs(self, segs_text, wav=None, raw=False, load_config_ret=None,
+              postprocess_side_effect=None, initial_prompt=""):
+        model_mock = mock.Mock()
+        model_mock.transcribe.return_value = (
+            [_FakeSeg(t) for t in segs_text], None)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "t.wav"
+            if wav is None:
+                _make_wav(path)
+            else:
+                wav(path)
+            req = json.dumps({"id": 7, "wav": str(path),
+                              "initial_prompt": initial_prompt,
+                              "raw": raw})
+            out_buf = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch(
+                    "core.daemon._load_model", return_value=model_mock))
+                stack.enter_context(mock.patch(
+                    "core.daemon._is_model_cached", return_value=True))
+                if load_config_ret is not None:
+                    stack.enter_context(mock.patch(
+                        "core.daemon.load_config", return_value=load_config_ret))
+                if postprocess_side_effect is not None:
+                    stack.enter_context(mock.patch(
+                        "core.daemon.postprocess",
+                        side_effect=postprocess_side_effect))
+                stack.enter_context(mock.patch(
+                    "sys.stdin",
+                    io.StringIO(req + "\n"
+                                + json.dumps({"cmd": "shutdown"}) + "\n")))
+                stack.enter_context(mock.patch("sys.stdout", out_buf))
+                daemon.main()
+        lines = [l for l in out_buf.getvalue().splitlines() if l.strip()]
+        return [json.loads(l) for l in lines]
+
+    def test_scratch_utterance_signals_structural_command(self):
+        msgs = self._msgs([" scratch that"])
+        reply = next(m for m in msgs if "id" in m)
+        self.assertEqual(reply["text"], "")
+        self.assertEqual(reply["command"], "scratch_that")
+
+    def test_trailing_scratch_types_literally(self):
+        # Destructive commands match standalone only (see core/commands.py):
+        # a sentence ending in the phrase is dictation, not a command.
+        msgs = self._msgs([" hello world scratch that"])
+        reply = next(m for m in msgs if "id" in m)
+        self.assertEqual(reply["text"], "hello world scratch that")
+        self.assertIsNone(reply["command"])
+
+    def test_normal_reply_carries_null_command(self):
+        msgs = self._msgs([" hello world"])
+        reply = next(m for m in msgs if "id" in m)
+        self.assertEqual(reply["text"], "hello world")
+        self.assertIn("command", reply)          # uniform schema: key present
+        self.assertIsNone(reply["command"])
+
+    def test_silence_gate_wins_before_detection(self):
+        # A silent clip returns pre-detection; a hallucinated scratch can't
+        # fire on silence. Shape pinned: {"text":"","command":null}.
+        def silence(path):
+            _make_wav(path, amplitude=0.0)
+        msgs = self._msgs([], wav=silence)
+        reply = next(m for m in msgs if "id" in m)
+        self.assertEqual(reply["text"], "")
+        self.assertIsNone(reply["command"])
+
+    def test_raw_mode_bypasses_detection_uniform_schema(self):
+        msgs = self._msgs([" scratch that"], raw=True)
+        reply = next(m for m in msgs if "id" in m)
+        self.assertIn("scratch that", reply["text"])   # raw segment JSON line
+        self.assertIsNone(reply["command"])
+
+    def test_error_replies_carry_no_command_key(self):
+        model_mock = mock.Mock()
+        model_mock.transcribe.side_effect = RuntimeError("boom")
+        with tempfile.TemporaryDirectory() as d:
+            wav = Path(d) / "t.wav"
+            _make_wav(wav)
+            req = json.dumps({"id": 1, "wav": str(wav), "initial_prompt": "",
+                              "raw": False})
+            out_buf = io.StringIO()
+            with mock.patch("core.daemon._load_model", return_value=model_mock), \
+                 mock.patch("core.daemon._is_model_cached", return_value=True), \
+                 mock.patch("sys.stdin", io.StringIO(req + "\n")), \
+                 mock.patch("sys.stdout", out_buf):
+                daemon.main()
+        msgs = [json.loads(l) for l in out_buf.getvalue().splitlines() if l.strip()]
+        reply = next(m for m in msgs if "id" in m)
+        self.assertIn("error", reply)
+        self.assertNotIn("command", reply)
+
+    def test_detection_runs_before_postprocess(self):
+        # The discriminator for ordering (QA-designed): a promoted rule that
+        # rewrites "that". Detection-first matches the phrase on RAW text and
+        # the remainder never contains it; postprocess-first would corrupt
+        # "cap that" into "Capitol X" and inject it literally.
+        cfg = {"fillers": [], "replacements": {"cap": "Capitol", "that": "X"},
+               "profiles": {}}
+        msgs = self._msgs([" hello world cap that"], load_config_ret=cfg)
+        reply = next(m for m in msgs if "id" in m)
+        self.assertEqual(reply["text"], "Hello world")
+        self.assertIsNone(reply["command"])
+
+    def test_transform_after_cleanup_with_fillers(self):
+        cfg = {"fillers": ["um"], "replacements": {}, "profiles": {}}
+        msgs = self._msgs([" um hello world all caps that"],
+                          load_config_ret=cfg)
+        reply = next(m for m in msgs if "id" in m)
+        self.assertEqual(reply["text"], "HELLO WORLD")
+
+    def test_filler_prefixed_scratch_detected(self):
+        cfg = {"fillers": ["um"], "replacements": {}, "profiles": {}}
+        msgs = self._msgs([" um scratch that"], load_config_ret=cfg)
+        reply = next(m for m in msgs if "id" in m)
+        self.assertEqual(reply["text"], "")
+        self.assertEqual(reply["command"], "scratch_that")
+
+    def test_postprocess_failure_skips_transform(self):
+        msgs = self._msgs([" hello all caps that"],
+                          postprocess_side_effect=RuntimeError("bad regex"))
+        reply = next(m for m in msgs if "id" in m)
+        self.assertEqual(reply["text"], "hello")     # raw remainder, untransformed
+        self.assertIsNone(reply["command"])
+    def test_scratch_phrase_across_segment_join(self):
+        # Whisper may split the phrase across segments; join happens before
+        # detection, so ["scratch"],["that"] is still the standalone command.
+        msgs = self._msgs(["scratch", "that"])
+        reply = next(m for m in msgs if "id" in m)
+        self.assertEqual(reply["command"], "scratch_that")
+
+    def test_keep_raw_path_still_echo_guards(self):
+        # Pins 6c67ae4: a postprocess failure must not skip the prompt-echo
+        # guard — echoed prompts are dropped even when cleanup failed.
+        msgs = self._msgs(["VivoType menu"],
+                          postprocess_side_effect=RuntimeError("bad regex"),
+                          initial_prompt="VivoType, menu")
+        reply = next(m for m in msgs if "id" in m)
+        self.assertEqual(reply["text"], "")
+        self.assertIsNone(reply["command"])
+
 
 
 if __name__ == "__main__":

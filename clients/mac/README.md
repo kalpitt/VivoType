@@ -27,8 +27,7 @@ There is **no Xcode project** — `build_app.sh` compiles every `.swift` file un
 | `UI/ActivationCoordinator.swift` | ref-counted `.regular`↔`.accessory` policy manager for setup windows |
 | `UI/BrandMark.swift` | accent-tinted rounded-square waveform logo used in first-run windows |
 | `UI/HUD.swift` | recording pill + capture toast |
-| `UI/PermissionsController.swift` | first-run permissions checklist |
-| `UI/OnboardingController.swift` | first-run engine-setup window |
+| `UI/SetupWindowController.swift` | first-run setup: engine download, permissions, guided practice |
 | `UI/SettingsController.swift`, `UI/ReviewController.swift` | settings + correction-review windows |
 
 VivoType lives in the **menu bar** (a mic icon, no Dock icon). The icon shows state — idle / recording / transcribing / error — and clicking it gives Pause, Review corrections, Settings, the build version, and Quit. On first launch (before either permission is granted) VivoType shows a guided **Permissions** checklist that explains and requests Microphone and Accessibility access (see below). Then **hold `Right-Option`, speak, release** to insert text into the focused app.
@@ -42,16 +41,18 @@ If you ever need to change them by hand, approve **VivoType** itself (this is th
 | Permission | Why | Where |
 |------------|-----|-------|
 | **Microphone** | Record your voice | Privacy & Security → **Microphone** → enable VivoType |
-| **Accessibility** | Detect the global hotkey and type/paste text into other apps | Privacy & Security → **Accessibility** → enable VivoType |
+| **Accessibility** | Type/paste text into other apps | Privacy & Security → **Accessibility** → enable VivoType |
 
-> If the hotkey doesn't respond, also enable VivoType under **Privacy & Security → Input Monitoring**, then relaunch the helper. After changing any permission, quit and restart the helper.
+> The global hotkey uses an event monitor (Input Monitoring territory). If the hotkey doesn't respond, also enable VivoType under **Privacy & Security → Input Monitoring**, then relaunch the helper. After changing any permission, quit and restart the helper.
 
 ## How Text Is Inserted
 
 - **Default:** synthetic keystrokes via the Accessibility API (types Unicode directly).
-- **Clipboard paste (`Cmd+V`) fallback** is used automatically when either:
-  1. Accessibility permission is **not** granted, or
-  2. the focused app is a **web browser** (Safari, Chrome, Firefox, Edge, Arc, Brave, …), where synthetic keystrokes are unreliable.
+- **Accessibility denied:** the transcript is copied to the clipboard as a normal
+  string and a toast asks you to press ⌘V. Synthetic paste is not attempted
+  (it also requires Accessibility).
+- **Web browsers** (Safari, Chrome, Firefox, Edge, Arc, Brave, …): when Accessibility
+  *is* granted, clipboard + synthetic ⌘V is used because keystrokes are unreliable there.
 
 ## Learning From Your Corrections
 

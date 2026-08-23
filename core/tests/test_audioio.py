@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from core.audioio import TARGET_SR, _resample, load_wav, write_wav
+from core.audioio import TARGET_SR, _resample, has_speech, load_wav, write_wav
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +175,56 @@ class WriteWavTests(unittest.TestCase):
             with wave.open(str(p), "rb") as wf:
                 raw = np.frombuffer(wf.readframes(TARGET_SR), dtype=np.int16)
         self.assertTrue(np.all(raw == 32767))
+
+
+# ---------------------------------------------------------------------------
+# has_speech (silence gate) tests
+# ---------------------------------------------------------------------------
+
+class HasSpeechTests(unittest.TestCase):
+    def test_pure_silence_is_not_speech(self):
+        self.assertFalse(has_speech(np.zeros(TARGET_SR, dtype=np.float32)))
+
+    def test_empty_array_is_not_speech(self):
+        self.assertFalse(has_speech(np.zeros(0, dtype=np.float32)))
+
+    def test_faint_mic_noise_is_not_speech(self):
+        # Electrical noise floor well below any real utterance.
+        rng = np.random.default_rng(42)
+        noise = (0.0005 * rng.standard_normal(TARGET_SR)).astype(np.float32)
+        self.assertFalse(has_speech(noise))
+
+    def test_dc_offset_alone_is_not_speech(self):
+        # A biased-but-silent mic: constant 0.1 offset, no signal.
+        self.assertFalse(has_speech(np.full(TARGET_SR, 0.1, dtype=np.float32)))
+
+    def test_speech_level_tone_is_speech(self):
+        t = np.arange(TARGET_SR, dtype=np.float64) / TARGET_SR
+        tone = (0.05 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+        self.assertTrue(has_speech(tone))
+
+    def test_short_burst_in_long_silence_is_speech(self):
+        # One word in a 3 s clip must count — the gate is per-window, not global.
+        clip = np.zeros(3 * TARGET_SR, dtype=np.float32)
+        t = np.arange(TARGET_SR // 5, dtype=np.float64) / TARGET_SR
+        clip[TARGET_SR:TARGET_SR + len(t)] = 0.05 * np.sin(2 * np.pi * 220 * t)
+        self.assertTrue(has_speech(clip))
+
+    def test_quiet_speech_still_passes(self):
+        # Very quiet-but-real speech (~ -40 dBFS) must NOT be eaten.
+        t = np.arange(TARGET_SR, dtype=np.float64) / TARGET_SR
+        tone = (0.01 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+        self.assertTrue(has_speech(tone))
+
+    def test_threshold_boundary_pinned(self):
+        # Pin the gate's edge (sine RMS = amplitude/√2 vs SILENCE_RMS=0.0025)
+        # so a future threshold tweak can't silently start eating quiet
+        # speakers or letting silence through.
+        t = np.arange(TARGET_SR, dtype=np.float64) / TARGET_SR
+        just_above = (0.0040 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+        just_below = (0.0030 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+        self.assertTrue(has_speech(just_above))
+        self.assertFalse(has_speech(just_below))
 
 
 # ---------------------------------------------------------------------------

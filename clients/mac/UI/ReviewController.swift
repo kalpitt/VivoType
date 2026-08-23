@@ -134,15 +134,21 @@ final class ReviewController: NSObject, NSWindowDelegate {
         row.heightAnchor.constraint(equalToConstant: 46).isActive = true
         row.widthAnchor.constraint(equalToConstant: 432).isActive = true
 
+        let risky = correction["risky"] as? Bool ?? false
+        let riskReason = correction["risk_reason"] as? String ?? ""
+
         let title = NSTextField(labelWithString: "\(from)  →  \(to)")
         title.frame = NSRect(x: 4, y: 24, width: 236, height: 16)
         title.font = .systemFont(ofSize: 13)
         row.addSubview(title)
 
-        let subtitle = NSTextField(labelWithString: "\(where_) · seen \(count)×")
+        let subtitleText = risky ? "⚠ \(where_) · seen \(count)× · risky"
+                                 : "\(where_) · seen \(count)×"
+        let subtitle = NSTextField(labelWithString: subtitleText)
         subtitle.frame = NSRect(x: 4, y: 6, width: 236, height: 14)
         subtitle.font = .systemFont(ofSize: 11)
-        subtitle.textColor = .secondaryLabelColor
+        subtitle.textColor = risky ? .systemOrange : .secondaryLabelColor
+        if risky { subtitle.toolTip = riskReason; title.toolTip = riskReason }
         row.addSubview(subtitle)
 
         row.addSubview(rowButton("Promote", #selector(promoteRow(_:)), index, x: 246, width: 74))
@@ -199,7 +205,21 @@ final class ReviewController: NSObject, NSWindowDelegate {
 
     @objc private func promoteAll() {
         guard !isProcessing else { return }
-        let allCorrections = corrections
+        // Bulk promotion never takes a risky rule (common-word rewrite or a
+        // single sighting) — those stay listed for a deliberate per-row click.
+        let allCorrections = corrections.filter { ($0["risky"] as? Bool) != true }
+        if allCorrections.isEmpty {
+            if !corrections.isEmpty {
+                let alert = NSAlert()
+                alert.messageText = "Only risky corrections are pending"
+                alert.informativeText =
+                    "Each remaining correction is flagged ⚠ — promoting it could rewrite "
+                    + "ordinary words. Hover a row to see why, and promote individually "
+                    + "if you're sure."
+                alert.runModal()
+            }
+            return
+        }
         beginProcessing()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }

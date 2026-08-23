@@ -15,6 +15,33 @@ import numpy as np
 
 TARGET_SR = 16_000
 
+# Silence gate: a clip must rise above this RMS (~ -52 dBFS) in at least one
+# 100 ms window to count as speech. Deliberately conservative — quiet-but-real
+# speech sits well above it — because a false "silence" verdict would eat the
+# user's words, while a false "speech" verdict merely costs one Whisper pass.
+SILENCE_RMS = 0.0025
+_SILENCE_WINDOW = TARGET_SR // 10  # 100 ms
+
+
+def has_speech(samples: np.ndarray, threshold: float = SILENCE_RMS,
+               window: int = _SILENCE_WINDOW) -> bool:
+    """Return True if any window of the clip rises above the silence floor.
+
+    Whisper hallucinates on silence — it echoes its initial_prompt or loops a
+    word — so callers gate transcription on this instead of trusting the model
+    to say nothing. Per-window DC offset is removed first, so a mic with a
+    constant bias (silent but nonzero) is still recognized as silence.
+    """
+    samples = np.asarray(samples)
+    for start in range(0, len(samples), window):
+        chunk = samples[start:start + window].astype(np.float64)
+        if chunk.size == 0:
+            continue
+        chunk -= chunk.mean()
+        if float(np.sqrt(np.mean(chunk ** 2))) >= threshold:
+            return True
+    return False
+
 
 def load_wav(path: Union[str, Path]) -> np.ndarray:
     """Read any WAV file; return a mono float32 array resampled to 16 kHz.

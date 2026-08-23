@@ -59,6 +59,16 @@ class PromoteTargetTests(unittest.TestCase):
             self.assertEqual(data["replacements"]["blr"], "Bengaluru")
             self.assertEqual(data["fillers"], ["um"])  # untouched
 
+    def test_rewrite_log_round_trip(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "corrections.jsonl"
+            entries = [{"from": "a", "to": "b"}, {"from": "c", "to": "d"}]
+            promote.rewrite_log(path, entries)
+            lines = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+            self.assertEqual(lines, entries)
+            promote.rewrite_log(path, [])  # empty log must not leave stale rows
+            self.assertEqual(path.read_text(), "")
+
 
 class CorruptionSafetyTests(unittest.TestCase):
     """A corrupt promotion target must never be silently overwritten (data loss)."""
@@ -96,6 +106,50 @@ class CorruptionSafetyTests(unittest.TestCase):
             self.assertEqual(len(log.read_text().strip().splitlines()), 1)
 
 
+class AssessRiskTests(unittest.TestCase):
+    """The quality gate that keeps garbage rules (the 'minu' -> 'menu' class)
+    out of bulk promotion."""
+
+    ENGLISH = {"give", "make", "menu", "today", "contact", "integrity", "minu"}
+
+    def test_common_english_from_is_risky(self):
+        risky, reason = promote.assess_risk("give", "make", 5, self.ENGLISH)
+        self.assertTrue(risky)
+        self.assertIn("real English word", reason)
+
+    def test_single_sighting_is_risky(self):
+        risky, reason = promote.assess_risk("wani", "Vaani", 1, self.ENGLISH)
+        self.assertTrue(risky)
+        self.assertIn("once", reason)
+
+    def test_repeated_uncommon_word_is_safe(self):
+        risky, reason = promote.assess_risk("wani", "Vaani", 2, self.ENGLISH)
+        self.assertFalse(risky)
+        self.assertEqual(reason, "")
+
+    def test_multiword_from_not_flagged_as_common_word(self):
+        # The common-word check applies to single words only; a phrase source
+        # is much more specific, so two sightings make it safe.
+        risky, _ = promote.assess_risk("view type", "VivoType", 2, self.ENGLISH)
+        self.assertFalse(risky)
+
+    def test_both_reasons_reported_together(self):
+        risky, reason = promote.assess_risk("menu", "minu", 1, self.ENGLISH)
+        self.assertTrue(risky)
+        self.assertIn("real English word", reason)
+        self.assertIn("once", reason)
+
+    def test_missing_word_list_degrades_to_count_gate_only(self):
+        # /usr/share/dict/words absent → empty english set: the common-word
+        # gate is silently gone (promote.main warns to stderr), but the
+        # sighting-count gate must keep working.
+        risky, _ = promote.assess_risk("give", "make", 5, set())
+        self.assertFalse(risky)  # documented degradation, not a crash
+        risky_once, reason = promote.assess_risk("give", "make", 1, set())
+        self.assertTrue(risky_once)
+        self.assertIn("once", reason)
+
+
 class MainTests(unittest.TestCase):
     def _setup(self, d):
         log = Path(d) / "corrections.jsonl"
@@ -115,14 +169,19 @@ class MainTests(unittest.TestCase):
             rc = promote.main(argv)
         return rc, out.getvalue()
 
-    def test_yes_promotes_routes_and_clears_log(self):
+    def test_yes_promotes_safe_rules_and_keeps_risky_ones(self):
         with tempfile.TemporaryDirectory() as d:
             log, lex, cfg = self._setup(d)
-            rc, _ = self._run(["--log", str(log), "--lexicon", str(lex), "--config", str(cfg), "--yes"])
+            rc, out = self._run(["--log", str(log), "--lexicon", str(lex), "--config", str(cfg), "--yes"])
             self.assertEqual(rc, 0)
+            # Seen 2× and not a common word → promoted.
             self.assertIn("Kalpit", json.loads(lex.read_text())["names"])
-            self.assertEqual(json.loads(cfg.read_text())["replacements"]["blr"], "Bengaluru")
-            self.assertEqual(log.read_text().strip(), "")  # log emptied
+            # Seen only once → risky; bulk promotion must NOT take it, and the
+            # entry stays in the log for a deliberate per-rule decision later.
+            self.assertNotIn("blr", json.loads(cfg.read_text())["replacements"])
+            self.assertIn("skipped (risky)", out)
+            remaining = [json.loads(l) for l in log.read_text().strip().splitlines()]
+            self.assertEqual([e["from"] for e in remaining], ["blr"])
 
     def test_dry_run_changes_nothing(self):
         with tempfile.TemporaryDirectory() as d:
@@ -194,6 +253,18 @@ class GuiInterfaceTests(unittest.TestCase):
             self.assertEqual(data[0]["target"], "lexicon")
             blr = next(x for x in data if x["from"] == "blr")
             self.assertEqual(blr["target"], "dictionary")
+
+    def test_list_json_includes_risk_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            log, lex, cfg = self._setup(d)
+            _, out = self._run(["--log", str(log), "--lexicon", str(lex),
+                                "--config", str(cfg), "--list-json"])
+            data = json.loads(out)
+            kalpith = next(x for x in data if x["from"] == "Kalpith")
+            self.assertFalse(kalpith["risky"])       # seen 2×, not a common word
+            blr = next(x for x in data if x["from"] == "blr")
+            self.assertTrue(blr["risky"])            # seen only once
+            self.assertIn("once", blr["risk_reason"])
 
     def test_apply_promote_routes_and_removes(self):
         with tempfile.TemporaryDirectory() as d:

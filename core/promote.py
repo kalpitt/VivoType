@@ -6,7 +6,7 @@ corrections by frequency (most-frequent first), and asks [y/N/d] for each
 (promote / skip / discard). On approval it routes the rule to the right place:
 
   • near-miss proper nouns -> names lexicon   (core/data/lexicon/contacts.json)
-  • abbreviations / phrases -> Indic dictionary (core/postprocess_config.json)
+  • abbreviations / phrases -> personal overlay (user_dictionary.json)
 
 Promoted and discarded corrections are removed from the pending log; skipped
 ones are kept for next time. Terminal-only — no visual UI.
@@ -14,7 +14,7 @@ ones are kept for next time. Terminal-only — no visual UI.
 Usage:
     python core/promote.py            # interactive review
     python core/promote.py --dry-run  # just list what's pending, change nothing
-    python core/promote.py --yes      # promote everything without prompting
+    python core/promote.py --yes      # promote everything not flagged risky
 """
 
 from __future__ import annotations
@@ -73,6 +73,40 @@ def group_corrections(items):
     return sorted(groups.values(), key=lambda g: (-g["count"], g["from"].lower()))
 
 
+# A rule must be seen this many times before bulk promotion will take it —
+# one sighting is as likely a one-off edit as a systematic mishearing.
+MIN_SIGHTINGS = 2
+
+
+def assess_risk(frm, to, count, english):
+    """Return (risky, reason) for a candidate rule.
+
+    Risky rules are excluded from bulk promotion (--yes / the GUI's "Promote
+    all") and flagged in the interactive/GUI review, but a user who reads the
+    warning can still promote them one at a time. This is the gate that would
+    have stopped 'minu' -> 'menu' (common-word rewrite fed into the ASR
+    prompt) and 'give' -> 'make' (single sighting of an ordinary edit)."""
+    reasons = []
+    if " " not in frm and frm.lower() in english:
+        reasons.append(
+            "'%s' is a real English word — this rule would rewrite it every "
+            "time you say it" % frm)
+    if count < MIN_SIGHTINGS:
+        reasons.append("seen only once — could be a one-off edit, not a mishearing")
+    return (bool(reasons), "; ".join(reasons))
+
+
+def _load_english_or_warn():
+    """The system word list, warning loudly (stderr) when it's unavailable —
+    without it the common-word risk gate silently stops catching rules like
+    'give' -> 'make', which is worth the user knowing."""
+    english = load_english_words()
+    if not english:
+        print("VivoType: system word list unavailable — the common-word risk "
+              "check on promotions is disabled.", file=sys.stderr)
+    return english
+
+
 def classify(frm, to, english):
     """Route a correction: 'lexicon' for near-miss names, else 'dictionary'."""
     frm, to = frm.strip(), to.strip()
@@ -128,10 +162,10 @@ def promote_to_dictionary(frm, to, path):
 
 
 def rewrite_log(path, entries):
+    """Rewrite the corrections log atomically (crash-safe)."""
     path = Path(path)
-    with path.open("w", encoding="utf-8") as fh:
-        for entry in entries:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    body = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries)
+    atomic_write_text(path, body)
 
 
 def apply_one(action, frm, to, log_path, lexicon_path, config_path, english=None):
@@ -149,6 +183,9 @@ def apply_one(action, frm, to, log_path, lexicon_path, config_path, english=None
 
     target = None
     if action == "promote":
+        # Deliberately NOT risk-gated: --apply is the per-rule path where the
+        # user has already seen the ⚠ warning in the Review UI and chosen to
+        # promote anyway. Only BULK promotion refuses risky rules.
         if english is None:
             english = load_english_words()
         target = classify(frm, to, english)
@@ -174,7 +211,8 @@ def main(argv=None):
     parser.add_argument("--lexicon", default=str(LEXICON_PATH))
     parser.add_argument("--config", default=str(USER_DICT_PATH),
                         help="Where dictionary promotions are written (default: personal overlay).")
-    parser.add_argument("--yes", action="store_true", help="Promote everything, no prompts.")
+    parser.add_argument("--yes", action="store_true",
+                        help="Promote everything not flagged risky, no prompts.")
     parser.add_argument("--dry-run", action="store_true", help="List suggestions; change nothing.")
     parser.add_argument("--list-json", action="store_true", help="Print pending corrections as JSON and exit.")
     parser.add_argument("--apply", action="store_true", help="Apply one action (with --from/--to/--action).")
@@ -184,10 +222,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.list_json:
-        english = load_english_words()
+        english = _load_english_or_warn()
         groups = group_corrections(load_corrections(args.log))
-        payload = [{"from": g["from"], "to": g["to"], "count": g["count"],
-                    "target": classify(g["from"], g["to"], english)} for g in groups]
+        payload = []
+        for g in groups:
+            risky, reason = assess_risk(g["from"], g["to"], g["count"], english)
+            payload.append({"from": g["from"], "to": g["to"], "count": g["count"],
+                            "target": classify(g["from"], g["to"], english),
+                            "risky": risky, "risk_reason": reason})
         print(json.dumps(payload, ensure_ascii=False))
         return 0
 
@@ -205,7 +247,7 @@ def main(argv=None):
         print("No pending corrections. 🎉")
         return 0
 
-    english = load_english_words()
+    english = _load_english_or_warn()
     print(f"{len(groups)} pending correction(s), most frequent first:\n")
 
     kept = []
@@ -213,8 +255,11 @@ def main(argv=None):
     discarded = 0
     for group in groups:
         target = classify(group["from"], group["to"], english)
+        risky, reason = assess_risk(group["from"], group["to"], group["count"], english)
         where = "names lexicon" if target == "lexicon" else "dictionary"
         summary = f"{group['from']!r} → {group['to']!r}   [{where}, seen {group['count']}×]"
+        if risky:
+            summary += f"\n  ⚠ {reason}"
 
         if args.dry_run:
             print("  " + summary)
@@ -222,6 +267,11 @@ def main(argv=None):
             continue
 
         if args.yes:
+            if risky:
+                # Bulk promotion never takes a risky rule — review it manually.
+                print("  " + summary + "\n  → skipped (risky)")
+                kept.extend(group["entries"])
+                continue
             choice = "y"
             print("  " + summary + "  → promoting")
         else:

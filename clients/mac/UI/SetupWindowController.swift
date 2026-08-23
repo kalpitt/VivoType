@@ -1,7 +1,7 @@
 // VivoType — unified first-run Setup window (Concurrent Onboarding).
 //
 // Replaces the former two-step OnboardingController + PermissionsController.
-// A single window drives a three-state flow while the Python environment and AI
+// A single window drives a four-state flow while the Python environment and AI
 // model are downloaded CONCURRENTLY in the background (see App.swift), so the
 // user spends the download latency granting permissions instead of staring at a
 // spinner:
@@ -14,7 +14,11 @@
 //             permission is never trapped.
 //   State 2 — Download/Setup (optional): a spinner + "Downloading your private
 //             AI model…", shown only if setup_core.sh hasn't already exited 0.
-//   State 3 — Success: a green checkmark + "You're all set!" and an "Open
+//   State 3 — Practice (first-run, once): after the model is ready, one guided
+//             "Say something" rep using the real push-to-talk hotkey into an
+//             in-window field — so the first real dictation isn't the first
+//             success. Quiet "Skip for now" escapes without trapping.
+//   State 4 — Success: a green checkmark + "You're all set!" and an "Open
 //             VivoType" button (the window's default button — Return triggers it)
 //             that reveals the menu-bar item.
 //
@@ -204,13 +208,20 @@ final class PermissionRowView: NSView {
 
 final class SetupWindowController: NSObject, NSWindowDelegate {
 
-    /// The three onboarding screens, swapped with a cross-fade inside one window.
-    private enum Screen { case permissions, downloading, success }
+    /// The onboarding screens, swapped with a cross-fade inside one window.
+    private enum Screen { case permissions, downloading, practice, success }
 
     /// Single source of truth for the download screen's spinner/label/retry.
-    private enum DownloadUI { case spinning, error(String) }
+    /// `pythonMissing` is the guided-install state for setup exit 42: download
+    /// button + numbered steps + a background poll that continues setup
+    /// automatically the moment a compatible Python appears.
+    private enum DownloadUI { case spinning, error(String), pythonMissing }
 
-    // Window + a fixed-size container the three screens fade in/out of.
+    /// UserDefaults key — set after a successful practice (or skip) so a
+    /// mid-setup relaunch doesn't force another rep.
+    static let practiceCompletedKey = "hasCompletedPracticeDictation"
+
+    // Window + a fixed-size container the screens fade in/out of.
     private var window: NSWindow!
     private let container = NSView()
     private var current: Screen = .permissions
@@ -228,11 +239,24 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
     private let progressLabel = NSTextField(labelWithString: "Downloading your private AI model…")
     private let reassuranceLabel = NSTextField(labelWithString: "")
     private var retryButton: NSButton!
+    private var downloadPythonButton: NSButton!
     private var reassuranceTimer: Timer?
+    // Guided Python install (setup exit 42): poll for a fresh interpreter.
+    private var pythonPollTimer: Timer?
+    private var pythonPollInFlight = false
 
-    // State 3 — success.
+    // State 3 — guided practice dictation.
+    private var practiceView: NSView!
+    private var practiceField: NSTextField!
+    private var practiceSubtitle: NSTextField!
+    private var practiceHint: NSTextField!
+    private var practiceAdvanceTimer: Timer?
+    private var practiceSucceeded = false
+
+    // State 4 — success.
     private var successView: NSView!
     private var openButton: NSButton!
+    private var successSubtitle: NSTextField!
 
     // Background setup_core.sh result (written on the main thread).
     private var setupFinished = false
@@ -259,6 +283,10 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
     /// permission re-grants leave this false (the model is already loaded).
     var waitsForModel = false
     private var modelLoading = false
+
+    /// Shown on the practice screen ("Hold Right Option and say hello").
+    /// Set by AppDelegate from the live Settings value before show().
+    var hotkeyLabel = "Right Option"
 
     override init() {
         super.init()
@@ -301,6 +329,7 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
 
         permissionsView = buildPermissionsView()
         downloadingView = buildDownloadingView()
+        practiceView = buildPracticeView()
         successView = buildSuccessView()
 
         // Start on State 1.
@@ -523,9 +552,16 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         reassuranceLabel.alignment = .center
         reassuranceLabel.isSelectable = false
         reassuranceLabel.lineBreakMode = .byWordWrapping
-        reassuranceLabel.maximumNumberOfLines = 2
+        reassuranceLabel.maximumNumberOfLines = 6
         reassuranceLabel.isHidden = true
         reassuranceLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        downloadPythonButton = NSButton(title: "Download Python 3",
+                                        target: self, action: #selector(downloadPythonTapped))
+        downloadPythonButton.bezelStyle = .rounded
+        downloadPythonButton.controlSize = .large
+        downloadPythonButton.isHidden = true
+        downloadPythonButton.translatesAutoresizingMaskIntoConstraints = false
 
         retryButton = NSButton(title: "Retry", target: self, action: #selector(retryTapped))
         retryButton.bezelStyle = .rounded
@@ -533,7 +569,8 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         retryButton.isHidden = true
         retryButton.translatesAutoresizingMaskIntoConstraints = false
 
-        let stack = NSStackView(views: [logo, spinner, progressLabel, reassuranceLabel, retryButton])
+        let stack = NSStackView(views: [logo, spinner, progressLabel, reassuranceLabel,
+                                        downloadPythonButton, retryButton])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 16
@@ -551,7 +588,89 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         return view
     }
 
-    // MARK: State 3 — success handoff
+    // MARK: State 3 — guided practice
+
+    private func buildPracticeView() -> NSView {
+        let view = NSView()
+
+        let logo = makeLogo(size: 48)
+
+        let titleLabel = NSTextField(labelWithString: "Try it once")
+        titleLabel.font = .systemFont(ofSize: 22, weight: .bold)
+        titleLabel.alignment = .center
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let subtitle = NSTextField(wrappingLabelWithString: "")
+        subtitle.font = .systemFont(ofSize: 13)
+        subtitle.textColor = .secondaryLabelColor
+        subtitle.alignment = .center
+        subtitle.isSelectable = false
+        subtitle.translatesAutoresizingMaskIntoConstraints = false
+        practiceSubtitle = subtitle
+        refreshPracticeCopy()
+
+        practiceField = NSTextField(string: "")
+        practiceField.placeholderString = "Your words will appear here"
+        practiceField.font = .systemFont(ofSize: 17, weight: .medium)
+        practiceField.alignment = .center
+        practiceField.isEditable = true
+        practiceField.isSelectable = true
+        practiceField.isBordered = true
+        practiceField.bezelStyle = .roundedBezel
+        practiceField.focusRingType = .default
+        practiceField.translatesAutoresizingMaskIntoConstraints = false
+        practiceField.setAccessibilityLabel("Practice dictation field")
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(practiceFieldDidChange(_:)),
+            name: NSControl.textDidChangeNotification,
+            object: practiceField)
+
+        practiceHint = NSTextField(wrappingLabelWithString:
+            "Tip: hold the key the whole time you speak, then release.")
+        practiceHint.font = .systemFont(ofSize: 11.5)
+        practiceHint.textColor = .tertiaryLabelColor
+        practiceHint.alignment = .center
+        practiceHint.isSelectable = false
+        practiceHint.translatesAutoresizingMaskIntoConstraints = false
+
+        let skipButton = NSButton(title: "Skip for now", target: self, action: #selector(skipPracticeTapped))
+        skipButton.bezelStyle = .inline
+        skipButton.isBordered = false
+        skipButton.contentTintColor = .tertiaryLabelColor
+        skipButton.font = .systemFont(ofSize: 11)
+        skipButton.translatesAutoresizingMaskIntoConstraints = false
+        skipButton.setAccessibilityLabel("Skip practice for now")
+
+        let topStack = NSStackView(views: [logo, titleLabel, subtitle])
+        topStack.orientation = .vertical
+        topStack.alignment = .centerX
+        topStack.spacing = 12
+        topStack.setCustomSpacing(24, after: logo)
+        topStack.setCustomSpacing(4, after: titleLabel)
+
+        let stack = NSStackView(views: [topStack, practiceField, practiceHint, skipButton])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 20
+        stack.setCustomSpacing(28, after: topStack)
+        stack.setCustomSpacing(12, after: practiceField)
+        stack.setCustomSpacing(24, after: practiceHint)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 40),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -40),
+            practiceField.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            practiceField.heightAnchor.constraint(equalToConstant: 44)
+        ])
+        return view
+    }
+
+    // MARK: State 4 — success handoff
 
     private func buildSuccessView() -> NSView {
         let view = NSView()
@@ -574,13 +693,13 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         titleLabel.alignment = .center
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let subtitle = NSTextField(wrappingLabelWithString:
-            "Hold the Right-Option key in any app to dictate.")
-        subtitle.font = .systemFont(ofSize: 13)
-        subtitle.textColor = .secondaryLabelColor
-        subtitle.alignment = .center
-        subtitle.isSelectable = false
-        subtitle.translatesAutoresizingMaskIntoConstraints = false
+        successSubtitle = NSTextField(wrappingLabelWithString:
+            "Hold the \(hotkeyLabel) key in any app to dictate.")
+        successSubtitle.font = .systemFont(ofSize: 13)
+        successSubtitle.textColor = .secondaryLabelColor
+        successSubtitle.alignment = .center
+        successSubtitle.isSelectable = false
+        successSubtitle.translatesAutoresizingMaskIntoConstraints = false
 
         // Tell the user WHERE VivoType lives — it's a menu-bar app with no Dock
         // icon or window, so point at the top-right and show the exact glyph.
@@ -596,12 +715,12 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
             openButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 200)
         ])
 
-        let stack = NSStackView(views: [check, titleLabel, subtitle, menuBarHint, openButton])
+        let stack = NSStackView(views: [check, titleLabel, successSubtitle, menuBarHint, openButton])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 16
         stack.setCustomSpacing(20, after: check)
-        stack.setCustomSpacing(20, after: subtitle)
+        stack.setCustomSpacing(20, after: successSubtitle)
         stack.setCustomSpacing(28, after: menuBarHint)
         stack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(stack)
@@ -660,6 +779,9 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
             // Setup already done while the user worked through permissions.
             if setupExitCode == 0 {
                 advanceAfterSetupSucceeded()
+            } else if setupExitCode == 42 {
+                transition(to: .downloading)
+                applyDownloadUI(.pythonMissing)
             } else {
                 transition(to: .downloading)
                 applyDownloadUI(.error(setupFailureMessage ?? defaultSetupError))
@@ -692,9 +814,84 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
     }
 
     /// AppDelegate calls this when the daemon reports `ready` (model resident).
+    /// First-run advances to Practice (one guided rep) unless already completed;
+    /// otherwise Success.
     func modelDidBecomeReady() {
         guard waitsForModel, modelLoading else { return }
         modelLoading = false
+        if shouldOfferPractice {
+            refreshPracticeCopy()
+            transition(to: .practice)
+        } else {
+            refreshSuccessCopy()
+            transition(to: .success)
+        }
+    }
+
+    private var shouldOfferPractice: Bool {
+        !UserDefaults.standard.bool(forKey: Self.practiceCompletedKey)
+    }
+
+    private func refreshPracticeCopy() {
+        practiceSubtitle?.stringValue =
+            "Hold \(hotkeyLabel) and say something — your words appear below. "
+            + "Same move you'll use in any app."
+    }
+
+    private func refreshSuccessCopy() {
+        if practiceSucceeded {
+            successSubtitle?.stringValue =
+                "You already did it. Hold \(hotkeyLabel) in any app to dictate."
+        } else {
+            successSubtitle?.stringValue =
+                "Hold the \(hotkeyLabel) key in any app to dictate."
+        }
+    }
+
+    /// Mark practice complete when real dictation lands non-empty text.
+    /// Prefer this over relying solely on NSTextField change notifications —
+    /// CGEvent injection does not always fire `textDidChange`.
+    func notePracticeTranscript(_ text: String) {
+        guard current == .practice, !practiceSucceeded else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if practiceField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            practiceField.stringValue = trimmed
+        }
+        completePracticeSuccess()
+    }
+
+    @objc private func practiceFieldDidChange(_ note: Notification) {
+        guard current == .practice, !practiceSucceeded else { return }
+        let text = practiceField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        completePracticeSuccess()
+    }
+
+    private func completePracticeSuccess() {
+        guard !practiceSucceeded else { return }
+        practiceSucceeded = true
+        UserDefaults.standard.set(true, forKey: Self.practiceCompletedKey)
+        practiceHint.stringValue = "Nice — that worked!"
+        practiceHint.textColor = .systemGreen
+        announce("Nice. That worked.")
+        practiceAdvanceTimer?.invalidate()
+        practiceAdvanceTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
+            self?.finishPractice()
+        }
+    }
+
+    @objc private func skipPracticeTapped() {
+        guard current == .practice, !practiceSucceeded else { return }
+        // Don't set the completed flag on skip — a mid-setup relaunch can offer
+        // practice again. First-run won't reappear once .venv exists anyway.
+        finishPractice()
+    }
+
+    private func finishPractice() {
+        practiceAdvanceTimer?.invalidate()
+        practiceAdvanceTimer = nil
+        refreshSuccessCopy()
         transition(to: .success)
     }
 
@@ -717,6 +914,9 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         guard permissionsCleared else { return }
         if exitCode == 0 {
             advanceAfterSetupSucceeded()
+        } else if exitCode == 42 {
+            if current != .downloading { transition(to: .downloading) }
+            applyDownloadUI(.pythonMissing)
         } else {
             if current != .downloading { transition(to: .downloading) }
             applyDownloadUI(.error(failureMessage ?? defaultSetupError))
@@ -735,6 +935,8 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         reassuranceTimer?.invalidate()
         reassuranceTimer = nil
         reassuranceLabel.isHidden = true
+        stopPythonPolling()
+        downloadPythonButton.isHidden = true
         switch state {
         case .spinning:
             spinner.isHidden = false
@@ -756,7 +958,82 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
             retryButton.isHidden = false
             ActivationCoordinator.shared.refocus(window)
             announce(message)
+        case .pythonMissing:
+            spinner.stopAnimation(nil)
+            spinner.isHidden = true
+            progressLabel.textColor = .labelColor
+            progressLabel.stringValue = "One more thing: VivoType needs Python 3"
+            reassuranceLabel.stringValue =
+                "Python is a free tool VivoType's speech engine runs on — everything stays "
+                + "on your Mac.\n1. Click “Download Python 3” (opens python.org).\n"
+                + "2. Run the downloaded installer.\n"
+                + "3. VivoType continues automatically once it's installed."
+            reassuranceLabel.isHidden = false
+            downloadPythonButton.isHidden = false
+            retryButton.isHidden = false
+            startPythonPolling()
+            ActivationCoordinator.shared.refocus(window)
+            announce("Python 3 is needed. Click Download Python 3, run the installer, "
+                     + "and VivoType will continue automatically.")
         }
+    }
+
+    // MARK: guided Python install (exit 42)
+
+    @objc private func downloadPythonTapped() {
+        if let url = URL(string: "https://www.python.org/downloads/") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Where a fresh Python 3.11+ lands on a Mac: the python.org framework dirs
+    /// and /usr/local/bin symlinks, or Homebrew's prefixes. /usr/bin/python3 is
+    /// deliberately NOT probed — without the developer tools it's a stub that
+    /// pops the "install command line tools" dialog, which a 3 s poll would spam.
+    private static func findCompatiblePython() -> String? {
+        var candidates: [String] = []
+        for minor in stride(from: 20, through: 11, by: -1) {
+            candidates.append("/Library/Frameworks/Python.framework/Versions/3.\(minor)/bin/python3")
+            candidates.append("/usr/local/bin/python3.\(minor)")
+            candidates.append("/opt/homebrew/bin/python3.\(minor)")
+        }
+        candidates += ["/usr/local/bin/python3", "/opt/homebrew/bin/python3"]
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: path)
+            proc.arguments = ["-c",
+                "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 11) else 1)"]
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            do { try proc.run() } catch { continue }
+            proc.waitUntilExit()
+            if proc.terminationStatus == 0 { return path }
+        }
+        return nil
+    }
+
+    /// Poll every 3 s (off the main thread) for a compatible interpreter; the
+    /// moment one appears, re-run setup so the user never has to find Retry.
+    private func startPythonPolling() {
+        pythonPollTimer?.invalidate()
+        pythonPollTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            guard let self = self, !self.pythonPollInFlight else { return }
+            self.pythonPollInFlight = true
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let found = Self.findCompatiblePython() != nil
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.pythonPollInFlight = false
+                    // Only act if we're still waiting on this state.
+                    if found && self.pythonPollTimer != nil { self.retryTapped() }
+                }
+            }
+        }
+    }
+
+    private func stopPythonPolling() {
+        pythonPollTimer?.invalidate()
+        pythonPollTimer = nil
     }
 
     // MARK: screen transitions (cross-fade)
@@ -765,6 +1042,7 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         switch screen {
         case .permissions: return permissionsView
         case .downloading: return downloadingView
+        case .practice:    return practiceView
         case .success:     return successView
         }
     }
@@ -792,11 +1070,16 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
                 outgoing.removeFromSuperview()
                 outgoing.alphaValue = 1   // reset for any future reuse
             }
-            // Put keyboard focus on the success screen's default button so Return
-            // works immediately and the accent styling renders.
-            if self.current == .success {
-                self.window.recalculateKeyViewLoop()
+            // Practice: focus the field so the real hotkey injects here.
+            // Success: focus the default button so Return opens VivoType.
+            self.window.recalculateKeyViewLoop()
+            switch self.current {
+            case .practice:
+                self.window.makeFirstResponder(self.practiceField)
+            case .success:
                 self.window.makeFirstResponder(self.openButton)
+            default:
+                break
             }
         })
 
@@ -818,6 +1101,7 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         switch screen {
         case .permissions: break  // announced implicitly when the window opens
         case .downloading: announce("Permissions granted. Downloading your private AI model.")
+        case .practice:    announce("Try it once. Hold \(hotkeyLabel) and say something.")
         case .success:     announce("You're all set. VivoType is ready. Press Return to open it.")
         }
     }
@@ -897,6 +1181,9 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         pollTimer = nil
         reassuranceTimer?.invalidate()
         reassuranceTimer = nil
+        practiceAdvanceTimer?.invalidate()
+        practiceAdvanceTimer = nil
+        stopPythonPolling()
         spinner.stopAnimation(nil)
         window.orderOut(nil)
         if heldForeground { heldForeground = false; ActivationCoordinator.shared.end() }
@@ -911,5 +1198,8 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         pollTimer = nil
         reassuranceTimer?.invalidate()
         reassuranceTimer = nil
+        practiceAdvanceTimer?.invalidate()
+        practiceAdvanceTimer = nil
+        stopPythonPolling()
     }
 }

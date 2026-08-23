@@ -1,12 +1,21 @@
 // VivoType brand asset generator — wordmark lockups + GitHub/web icons.
 // Pure AppKit (no dependencies). Source artwork = the attached canonical icons.
-// Run:  swift make_brand.swift
+// Run (from the private master repo root):
+//   swift branding/_staging/make_brand.swift [iconsetDir] [outDir]
+// or override via env vars: VIVOTYPE_ICONSET_DIR, VIVOTYPE_BRAND_OUT
 import AppKit
 
 // ---- paths ----------------------------------------------------------------
-let CANON = "/Users/kalpit/Documents/Voice/clients/mac/Assets/VivoType.iconset"
+// No machine-specific path is baked in: CLI args win, then env vars, then a fallback
+// that assumes the script runs from the repo root (the normal case).
+let args = CommandLine.arguments
+let defaultCanon = "clients/mac/Assets/VivoType.iconset"
+let defaultOut = "branding"
+let CANON = args.count > 1 ? args[1]
+    : ProcessInfo.processInfo.environment["VIVOTYPE_ICONSET_DIR"] ?? defaultCanon
 let MASTER = "\(CANON)/icon_512x512@2x.png"
-let OUT = "/Users/kalpit/Documents/Voice/branding"
+let OUT = args.count > 2 ? args[2]
+    : ProcessInfo.processInfo.environment["VIVOTYPE_BRAND_OUT"] ?? defaultOut
 
 let fm = FileManager.default
 for d in ["wordmark", "github", "web"] {

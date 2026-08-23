@@ -18,7 +18,12 @@ Record a sample with:
 ```bash
 source .venv/bin/activate
 python core/record.py --label "the quick brown fox"
+# or: python -m core.record --label "…"
 ```
+
+WAVs land in the writable data dir (`core/data/raw/` in a repo checkout, or
+Application Support once installed). `labels.csv` stores a path relative to that
+data dir when possible, so a custom `--outdir` does not orphan the manifest row.
 
 > **Privacy:** your recordings (`raw/*.wav`) and `labels.csv` are git-ignored on
 > purpose — personal voice data should not be committed. Only this README and

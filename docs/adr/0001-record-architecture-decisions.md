@@ -14,7 +14,7 @@ Crucially, every ADR must include a specific `## 🤖 Agent Directives` section 
 
 ## Consequences
 - Better onboarding for both human developers and AI agents.
-- Agents are explicitly instructed by `CLAUDE.md` to read the ADR index before proposing massive architectural shifts.
+- Agents are explicitly instructed by `AGENTS.md` to read the ADR index before proposing massive architectural shifts.
 - Slight overhead in maintaining documentation.
 
 ## 🤖 Agent Directives

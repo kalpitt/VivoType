@@ -11,9 +11,25 @@
 
 set -euo pipefail
 
+# shellcheck source=lib/publish_safety_gate.sh
+source "$(cd "$(dirname "$0")" && pwd)/lib/publish_safety_gate.sh"
+
 MASTER_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PUBLIC_DIR="$(cd "$MASTER_DIR/.." && pwd)/VivoType"
 DRY_RUN=false
+
+# The canary VALUE lives only in the excluded context/STATE.md — never as a
+# literal here, because this script itself is published and a hardcoded token
+# would plant the tripwire string into the very history the gate watches
+# (found 2026-08-23 when the gate tripped on its own script). Fail closed if
+# the canary is missing: an unplanted tripwire passes vacuously.
+CANARY="$(grep -m1 -o 'VIVOTYPE-PRIVATE-CANARY-[A-Za-z0-9-]\+' \
+  "$MASTER_DIR/context/STATE.md" || true)"
+if [ -z "$CANARY" ]; then
+  echo "FATAL: no canary planted in context/STATE.md — refusing to publish:" >&2
+  echo "       the leak tripwire would pass vacuously. Plant it first." >&2
+  exit 1
+fi
 
 for arg in "$@"; do
   case "$arg" in
@@ -67,7 +83,13 @@ RSYNC_ARGS=(
   --exclude="diff_report.txt"       # internal diff artifact
   --exclude="core/data/prompts/"    # personal training paragraph (names, anecdotes)
   --exclude="CLAUDE.md"             # internal workflow instructions for the private repo
+  --exclude="AGENTS.md"             # rulebook renamed 2026-07-12 — same exclusion policy
   --exclude=".claude/"              # Claude Code session data
+  --exclude="docs/FABLE5_SESSION_PROMPTS.md"  # private cross-repo planning content: names other
+                                    # repos and contains local machine paths. Saavdhan's
+                                    # publish_mirror.sh already strips this same file; this
+                                    # copy was never excluded here — found 2026-07-31 when the
+                                    # new local-path gate tripped on it during a dry run.
 )
 
 if $DRY_RUN; then
@@ -107,7 +129,15 @@ echo ""
 echo "=== Done ==="
 echo ""
 
-# ── 5. Push to public GitHub remote (if one is configured) ──────────────────
+# ── 5. Safety gates — defense-in-depth even though the mirror has fresh history ──
+gate_path_absent_from_history "$PUBLIC_DIR" "context/"
+gate_path_absent_from_history "$PUBLIC_DIR" "CLAUDE.md"
+gate_path_absent_from_history "$PUBLIC_DIR" "AGENTS.md"
+gate_canary_absent_from_history "$PUBLIC_DIR" "$CANARY"
+gate_no_local_paths_in_content "$PUBLIC_DIR"
+echo "Safety gates passed."
+
+# ── 6. Push to public GitHub remote (if one is configured) ──────────────────
 cd "$PUBLIC_DIR"
 if git remote get-url origin &>/dev/null; then
   git push origin main

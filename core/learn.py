@@ -35,6 +35,18 @@ def _tokens(text):
     return _WORD.findall(text)
 
 
+def _is_garbage_pair(frm, to):
+    """Pairs that can never become a good rule and only pollute the review
+    queue: a side that is a single character, or nothing but digits (e.g. the
+    observed '7' -> 'driven' — a numeral swap is an edit, not a mishearing)."""
+    for side in (frm, to):
+        if len(side) < 2:
+            return True
+        if all(tok.isdigit() for tok in side.split()):
+            return True
+    return False
+
+
 def diff_corrections(original, corrected):
     """Return word-level substitutions turning `original` into `corrected`."""
     o = _tokens(original)
@@ -46,6 +58,8 @@ def diff_corrections(original, corrected):
             continue
         frm = " ".join(o[i1:i2])
         to = " ".join(c[j1:j2])
+        if _is_garbage_pair(frm, to):
+            continue
         if frm and to and frm.lower() != to.lower():
             corrections.append({
                 "from": frm,

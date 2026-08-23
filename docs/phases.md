@@ -16,7 +16,7 @@
 - **DoD:** `python core/cli.py sample_indian_accent.wav` prints text with filler words removed and "blr" replaced with "Bengaluru".
 
 **Phase 3: macOS Hotkey & Text Insertion**
-- Build the macOS background helper defined in `docs/mac-client.md`. 
+- Build the macOS background helper (now `clients/mac/`, contract in `clients/mac/CLAUDE.md`). 
 - **DoD:** User presses the global hotkey, speaks, releases the hotkey, and text successfully appears in the macOS Notes app.
 
 **Phase 4: Personalization Hooks**
@@ -161,7 +161,7 @@ Applies a Figma design brief's layouts to the shipped app using native system co
 
 - **DoD:** onboarding, permissions, settings windows use the new layout; menu shows a live status dot and a Model submenu; all colors are system semantic; build passes; manual verification confirmed. ✅
 
-**Phase 15: App Icon & Brand Assets (in progress)**
+**Phase 15: App Icon & Brand Assets** ✅
 
 Ships VivoType's first real app icon (previously deferred since Phase 6) and lands a starter brand package.
 
@@ -177,6 +177,22 @@ Ships VivoType's first real app icon (previously deferred since Phase 6) and lan
 
 *`branding/` (new).* Brand basics (palette/type/usage), the branding review, the beginner roadmap, and "VivoType AI" wordmark lockups (transparent/light/dark).
 
-- **DoD (pending macOS build):** `build_app.sh` produces `VivoType.app` whose icon appears in Finder/Dock; first-run windows show the real icon; warning-free Swift build; manual verification on an Apple-Silicon Mac. ⏳
+- **DoD:** `build_app.sh` produces `VivoType.app` whose icon appears in Finder/Dock; first-run windows show the real icon; warning-free Swift build; manual verification on an Apple-Silicon Mac. ✅ (iconutil → `AppIcon.icns` verified 2026-07-13 on `/build-sign`)
 
 **Deferred to a future phase:** Liquid Glass `.icon` (Icon Composer) for macOS 26; editable vector master; finalized wordmark in Inter.
+
+**Phase 16: Per-App Post-Processing Contexts** ✅ (merged via PR #34, 2026-08-22)
+
+Lets dictation rules differ per destination app ("Contexts"): currency conversion and filler removal toggle per profile, each profile may add a replacements overlay over the top-level defaults, and the Settings window maps frontmost apps to profiles. One warm model always (ADR-0002 untouched); the daemon NDJSON protocol gained one optional `"profile"` request field with the reply shape unchanged (governance gate: plan approved by Kalpit before code).
+
+*`core/postprocess.py` (updated).* `load_config()` parses + validates the optional `profiles` object (malformed entries skipped with one stderr warning; explicit `profiles["default"]` ignored). New `resolve_profile(config, name)` returns the effective rule set — unknown/non-string names degrade to default behavior. `postprocess(text, config, profile="default")` gates `convert_currency`/`remove_fillers`; every other stage stays unconditional, so default behavior is byte-for-byte historical.
+
+*`core/daemon.py` (updated).* Parses `profile` off the request (non-string/empty coerced to default), threads it into `_transcribe` → postprocess. Reload guard: a config reload that RAISES mid-loop keeps the last-good rules alive and warns once per distinct mtime, instead of killing the daemon (fixes a pre-existing crash amplified by frequent profile edits).
+
+*`core/cli.py`, `core/config.py` (updated).* CLI gains `--profile` so daemon-fallback retries apply identical rules. `app_profiles` (bundle ID → profile name) joins DEFAULTS with soft type checks so Swift-written mappings survive Python saves.
+
+*`clients/mac/Daemon.swift`, `App.swift`, `Settings.swift` (updated).* `transcribe()` carries `profile`; resolution happens once at transcribe start (the app about to RECEIVE text) and feeds both daemon and fallback paths. `Settings` round-trips `app_profiles` — without this every settings save wiped all mappings.
+
+*`clients/mac/UI/SettingsController.swift` (updated).* New Contexts card: one row per mapping (app display name + profile popup + remove), "Add frontmost app" captures the frontmost non-VivoType bundle ID mapped to "default". Profile definitions stay JSON-only in v1 (live-reloaded on mtime change). Bundle IDs are never logged or toasted (rule codified in clients/mac/CLAUDE.md).
+
+- **DoD:** suite green including profile threading/golden-default/reload-resilience tests (261/261); signed build clean; architecture/security/QA subagent reviews APPROVE WITH NITS with nits fixed; manual smoke per PR #34 body (mapped app keeps $ unconverted, unmapped apps convert, CLI-fallback parity, deleted-profile popup shows "(missing)"). ⚠️ smoke pending Kalpit post-merge

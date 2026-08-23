@@ -9,12 +9,74 @@ from pathlib import Path
 
 from core.postprocess import (
     apply_replacements,
+    collapse_repetitions,
     config_mtime,
     convert_currency,
     load_config,
     postprocess,
     remove_fillers,
+    resolve_profile,
 )
+from core import postprocess as pp
+
+
+class CollapseRepetitionTests(unittest.TestCase):
+    """Whisper repetition loops ("guilty guilty guilty …") must collapse to a
+    single occurrence; deliberate doubles must survive."""
+
+    def test_word_loop_collapses_to_one(self):
+        self.assertEqual(
+            collapse_repetitions("guilty guilty guilty guilty guilty"), "guilty")
+
+    def test_triple_collapses(self):
+        self.assertEqual(collapse_repetitions("guilty guilty guilty"), "guilty")
+
+    def test_deliberate_double_survives(self):
+        self.assertEqual(collapse_repetitions("very very good"), "very very good")
+
+    def test_loop_inside_sentence(self):
+        self.assertEqual(
+            collapse_repetitions("I feel guilty guilty guilty guilty about it"),
+            "I feel guilty about it")
+
+    def test_case_insensitive_first_occurrence_kept(self):
+        self.assertEqual(collapse_repetitions("Guilty guilty guilty"), "Guilty")
+
+    def test_phrase_loop_with_punctuation(self):
+        self.assertEqual(
+            collapse_repetitions("thank you. thank you. thank you."),
+            "thank you.")
+
+    def test_comma_separated_loop(self):
+        self.assertEqual(collapse_repetitions("yes, yes, yes, yes"), "yes")
+
+    def test_devanagari_loop(self):
+        self.assertEqual(collapse_repetitions("ठीक ठीक ठीक ठीक है"), "ठीक है")
+
+    def test_normal_dictation_untouched(self):
+        text = "Move the meeting to Monday and tell Priya about the budget."
+        self.assertEqual(collapse_repetitions(text), text)
+
+    def test_dictated_pin_digits_survive(self):
+        # "1 1 1 1" is someone reading out a PIN/OTP, not a decoder loop.
+        self.assertEqual(collapse_repetitions("my pin is 1 1 1 1"), "my pin is 1 1 1 1")
+
+    def test_repeated_multidigit_numbers_survive(self):
+        self.assertEqual(collapse_repetitions("codes 10 10 10 done"), "codes 10 10 10 done")
+
+    def test_spelled_letters_survive(self):
+        self.assertEqual(collapse_repetitions("the code is A A A B"), "the code is A A A B")
+
+    def test_deliberate_word_triple_is_collapsed_by_design(self):
+        # Documented trade-off: a real "no no no" loses its emphasis so that
+        # hallucinated loops die. Pinned so a future change is deliberate.
+        self.assertEqual(collapse_repetitions("no no no"), "no")
+
+    def test_full_pipeline_collapses_loops(self):
+        cfg = {"fillers": [], "replacements": {}}
+        self.assertEqual(
+            postprocess("The verdict was guilty guilty guilty guilty guilty.", cfg),
+            "The verdict was guilty.")
 
 
 class CurrencyTests(unittest.TestCase):
@@ -54,6 +116,52 @@ class CurrencyTests(unittest.TestCase):
     def test_kg_suffix_not_matched(self):
         self.assertEqual(convert_currency("$10kg"), "$10kg")
 
+    def test_100k_rolls_over_to_crore(self):
+        # 100 lakh IS 1 crore; Indian usage never says "₹100 lakh" for salaries.
+        self.assertEqual(convert_currency("$100k"), "₹1 crore")
+
+    def test_250k_rolls_over_to_fractional_crore(self):
+        self.assertEqual(convert_currency("$250k CTC"), "₹2.5 crore CTC")
+
+    def test_99k_stays_in_lakh(self):
+        self.assertEqual(convert_currency("$99k"), "₹99 lakh")
+
+    def test_sub_crore_million_downshifts_to_lakh(self):
+        # Nobody says "₹0.5 crore" — fractional-crore sums read in lakh.
+        self.assertEqual(convert_currency("$0.5M"), "₹50 lakh")
+
+    def test_quarter_million_downshifts_to_lakh(self):
+        self.assertEqual(convert_currency("$0.25M deal"), "₹25 lakh deal")
+
+    def test_whole_million_stays_in_crore(self):
+        self.assertEqual(convert_currency("$1M"), "₹1 crore")
+
+    def test_trailing_zero_decimal_normalized(self):
+        # "$1.50k" must read "₹1.5 lakh", not "₹1.50 lakh".
+        self.assertEqual(convert_currency("$1.50k"), "₹1.5 lakh")
+
+    def test_trailing_zero_million_normalized(self):
+        self.assertEqual(convert_currency("$2.10M"), "₹2.1 crore")
+
+    def test_rs_prefix_becomes_symbol(self):
+        self.assertEqual(convert_currency("Rs 500"), "₹500")
+
+    def test_rs_dot_prefix_with_grouped_number(self):
+        self.assertEqual(convert_currency("a Rs. 2,000 fine"), "a ₹2,000 fine")
+
+    def test_inr_prefix_becomes_symbol(self):
+        self.assertEqual(convert_currency("INR 1200"), "₹1200")
+
+    def test_rupees_suffix_becomes_symbol(self):
+        self.assertEqual(convert_currency("worth 500 rupees"), "worth ₹500")
+
+    def test_rs_without_number_untouched(self):
+        self.assertEqual(convert_currency("the rs value"), "the rs value")
+
+    def test_rs_inside_quotes_untouched(self):
+        text = 'she said "Rs 500" twice'
+        self.assertEqual(convert_currency(text), text)
+
 
 class FillerAndDictionaryTests(unittest.TestCase):
     def setUp(self):
@@ -74,6 +182,108 @@ class FillerAndDictionaryTests(unittest.TestCase):
 
     def test_remove_fillers_noop_when_empty(self):
         self.assertEqual(remove_fillers("hello world", []), "hello world")
+
+    def test_filler_between_sentences_leaves_no_doubled_period(self):
+        # "I went. Um. Then" must not normalize to "I went.. Then".
+        out = postprocess("I went. Um. Then we left.", self.cfg)
+        self.assertEqual(out, "I went. Then we left.")
+
+    def test_filler_after_question_mark_leaves_single_mark(self):
+        out = postprocess("Ready? Uh. Let us start.", self.cfg)
+        self.assertEqual(out, "Ready? Let us start.")
+
+    def test_genuine_ellipsis_preserved(self):
+        # A real "..." has no spaces between the dots and must survive.
+        self.assertEqual(postprocess("Wait... okay", self.cfg), "Wait... okay")
+
+    def test_leading_filler_strip_restores_capital(self):
+        # Stripping "Um, " must not leave the sentence starting lowercase.
+        out = postprocess("Um, actually we should go.", self.cfg)
+        self.assertEqual(out, "Actually we should go.")
+
+    def test_leading_um_period_does_not_leave_orphan_dot(self):
+        out = postprocess("Um. Then we left.", self.cfg)
+        self.assertEqual(out, "Then we left.")
+
+    def test_leading_uh_period_does_not_leave_orphan_dot(self):
+        out = postprocess("Uh. Let us start.", self.cfg)
+        self.assertEqual(out, "Let us start.")
+
+    def test_multiple_leading_um_period_fillers(self):
+        out = postprocess("Um. Um. Hello there.", self.cfg)
+        self.assertEqual(out, "Hello there.")
+
+    def test_leading_ellipsis_preserved(self):
+        # Must not strip a genuine "..." — only a single orphan mark + space.
+        self.assertEqual(postprocess("... okay then", self.cfg), "... okay then")
+
+    def test_multiple_leading_fillers_restore_capital(self):
+        out = postprocess("Uh, er, let us start.", self.cfg)
+        self.assertEqual(out, "Let us start.")
+
+    def test_mixed_case_first_word_not_capitalized(self):
+        # "iPhone" is intentionally mixed-case; forcing "IPhone" would be worse.
+        out = postprocess("Um, iPhone rocks.", self.cfg)
+        self.assertEqual(out, "iPhone rocks.")
+
+    def test_all_lowercase_dictation_left_alone(self):
+        # No filler stripped, original started lowercase — don't invent a capital.
+        self.assertEqual(postprocess("just a note", self.cfg), "just a note")
+
+    def test_percent_after_number_tightened(self):
+        out = postprocess("growth was 10 % this year", self.cfg)
+        self.assertEqual(out, "growth was 10% this year")
+
+    def test_percent_not_after_number_untouched(self):
+        out = postprocess("use the % operator", self.cfg)
+        self.assertEqual(out, "use the % operator")
+
+    def test_rupee_symbol_before_number_tightened(self):
+        self.assertEqual(postprocess("paid ₹ 500 cash", self.cfg), "paid ₹500 cash")
+
+    def test_dollar_symbol_before_number_tightened(self):
+        self.assertEqual(postprocess("about $ 500 total", self.cfg), "about $500 total")
+
+    def test_no_space_before_danda(self):
+        # danda (।) is the Devanagari full stop and follows the same spacing rules.
+        self.assertEqual(postprocess("नमस्ते ।", self.cfg), "नमस्ते।")
+
+    def test_filler_between_danda_sentences_leaves_single_danda(self):
+        out = postprocess("अच्छा। um। चलो", self.cfg)
+        self.assertEqual(out, "अच्छा। चलो")
+
+    def test_space_inserted_after_danda(self):
+        out = postprocess("नमस्ते।फिर मिलेंगे", self.cfg)
+        self.assertEqual(out, "नमस्ते। फिर मिलेंगे")
+
+    def test_double_danda_verse_marker_preserved(self):
+        # ॥ (U+0965, verse end) is its own character and must survive untouched.
+        self.assertEqual(postprocess("शुभम् ॥", self.cfg), "शुभम्॥")
+
+    def test_devanagari_latin_join_gets_space(self):
+        # Code-switched runs sometimes arrive glued together.
+        out = postprocess("मेरीmeeting कल है", self.cfg)
+        self.assertEqual(out, "मेरी meeting कल है")
+
+    def test_latin_devanagari_join_gets_space(self):
+        self.assertEqual(postprocess("officeजाना है", self.cfg), "office जाना है")
+
+    def test_devanagari_digit_join_gets_space(self):
+        self.assertEqual(postprocess("कल10 बजे", self.cfg), "कल 10 बजे")
+
+    def test_already_spaced_code_switch_untouched(self):
+        text = "मैं office जा रहा हूँ"
+        self.assertEqual(postprocess(text, self.cfg), text)
+
+    def test_glued_rupee_amount_converts_after_split(self):
+        # The script-boundary split must run BEFORE currency conversion, so a
+        # glued amount is both spaced and ₹-converted in one pass.
+        out = postprocess("मैंने50 rupees दिए", self.cfg)
+        self.assertEqual(out, "मैंने ₹50 दिए")
+
+    def test_glued_dollar_amount_converts_after_split(self):
+        out = postprocess("मुझे$10k मिले", self.cfg)
+        self.assertEqual(out, "मुझे ₹10 lakh मिले")
 
     def test_replacement_value_with_backslash_is_literal(self):
         # A dictionary value containing a regex backreference token (e.g. "\1")
@@ -166,6 +376,186 @@ class LoadConfigTests(unittest.TestCase):
             self.assertIn("erm", cfg["fillers"])     # from overlay
             self.assertEqual(cfg["replacements"]["blr"], "Bengaluru")   # base
             self.assertEqual(cfg["replacements"]["kalpith"], "Kalpit")  # overlay
+
+
+class ProfileTests(unittest.TestCase):
+    """Per-app contexts: a named profile toggles convert_currency /
+    remove_fillers and merges its replacements over the defaults. "default"
+    (or an unknown name) must be exactly the historical behavior."""
+
+    CFG = {
+        "fillers": ["um"],
+        "replacements": {"blr": "Bengaluru"},
+        "profiles": {
+            "code": {
+                "convert_currency": False,
+                "remove_fillers": False,
+                "replacements": {},
+            },
+        },
+    }
+
+    def setUp(self):
+        # Module-level warn-once set persists across the whole test process;
+        # clear it so warning assertions can't fail order-dependently.
+        pp._WARNED_PROFILES.clear()
+
+    def test_default_profile_matches_no_profile_arg(self):
+        self.assertEqual(
+            postprocess("um moving to blr", self.CFG),
+            postprocess("um moving to blr", self.CFG, profile="default"),
+        )
+
+    def test_convert_currency_disabled_leaves_dollars(self):
+        out = postprocess("that costs $10k today", self.CFG, profile="code")
+        self.assertIn("$10k", out)
+        self.assertNotIn("₹", out)
+
+    def test_remove_fillers_disabled_keeps_um(self):
+        self.assertEqual(postprocess("um hello there", self.CFG, profile="code"),
+                         "um hello there")
+
+    def test_profile_replacements_override_default(self):
+        cfg = {
+            "fillers": [],
+            "replacements": {"todo": "backlog"},
+            "profiles": {"work": {"replacements": {"todo": "TODOTicket"}}},
+        }
+        self.assertEqual(postprocess("todo", cfg, profile="work"), "TODOTicket")
+        # Default rules keep the top-level mapping.
+        self.assertEqual(postprocess("todo", cfg, profile="default"), "backlog")
+
+    def test_profile_replacements_override_promoted_overlay(self):
+        # Precedence is deliberate: a context term beats a personally promoted
+        # one on collision (promote.py writes the overlay).
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / "base.json"
+            overlay = Path(d) / "overlay.json"
+            base.write_text(json.dumps({
+                "fillers": [], "replacements": {"acme": "Acme Corp"},
+                "profiles": {"legal": {"replacements": {"acme": "ACME Ltd"}}},
+            }), encoding="utf-8")
+            overlay.write_text(json.dumps({"replacements": {"acme": "Acme Inc"}}),
+                               encoding="utf-8")
+            cfg = load_config(base, user_path=overlay)
+        self.assertEqual(postprocess("acme", cfg, profile="legal"), "ACME Ltd")
+
+    def test_unknown_profile_falls_back_to_default(self):
+        pp._WARNED_PROFILES.clear()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            out = postprocess("$10k um blr", self.CFG, profile="no-such-profile")
+        self.assertEqual(out, postprocess("$10k um blr", self.CFG))
+        self.assertIn("unknown profile 'no-such-profile'", err.getvalue())
+
+    def test_unknown_profile_warned_once_per_process(self):
+        pp._WARNED_PROFILES.clear()
+        with contextlib.redirect_stderr(io.StringIO()):
+            postprocess("x", self.CFG, profile="warn-once")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            postprocess("x", self.CFG, profile="warn-once")
+        self.assertNotIn("unknown profile", err.getvalue())
+
+    def test_absent_toggles_default_true(self):
+        cfg = {"fillers": ["um"], "replacements": {},
+               "profiles": {"mail": {}}}
+        self.assertEqual(postprocess("um hi $10k", cfg, profile="mail"),
+                         "hi ₹10 lakh")
+
+    def test_non_string_profile_name_is_just_unknown(self):
+        pp._WARNED_PROFILES.clear()
+        resolved = resolve_profile(self.CFG, 5)
+        self.assertTrue(resolved["convert_currency"])
+        self.assertEqual(resolved["replacements"], {"blr": "Bengaluru"})
+
+    def test_unicode_profile_name_works_end_to_end(self):
+        cfg = {"fillers": ["um"], "replacements": {},
+               "profiles": {"मेराcontext": {"convert_currency": False}}}
+        out = postprocess("um $10k", cfg, profile="मेराcontext")
+        self.assertIn("$10k", out)
+
+
+class ProfileConfigValidationTests(unittest.TestCase):
+    """load_config must parse and validate the optional profiles object:
+    malformed entries are skipped with a stderr warning, never fatal."""
+
+    def setUp(self):
+        pp._WARNED_PROFILES.clear()
+
+    def _write_base(self, d, obj, name="base.json"):
+        path = Path(d) / name
+        path.write_text(json.dumps(obj), encoding="utf-8")
+        return path
+
+    def _load(self, obj):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = self._write_base(tmp.name, obj)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            cfg = load_config(base, user_path=Path(tmp.name) / "no-overlay.json")
+        return cfg, err.getvalue()
+
+    def test_profiles_parsed_and_returned(self):
+        cfg, _ = self._load({"fillers": [], "replacements": {},
+                             "profiles": {"code": {"convert_currency": False}}})
+        self.assertEqual(cfg["profiles"], {"code": {"convert_currency": False}})
+
+    def test_missing_profiles_key_yields_empty(self):
+        cfg, _ = self._load({"fillers": [], "replacements": {}})
+        self.assertEqual(cfg["profiles"], {})
+
+    def test_profiles_not_an_object_warns_and_drops_all(self):
+        cfg, err = self._load({"fillers": [], "replacements": {},
+                               "profiles": ["code"]})
+        self.assertEqual(cfg["profiles"], {})
+        self.assertIn("not a JSON object", err)
+
+    def test_malformed_entry_skipped_with_warning(self):
+        for bad in ("a string", 5, {"replacements": "nope"},
+                    {"convert_currency": "false"}, {"remove_fillers": 1}):
+            with self.subTest(bad=bad):
+                cfg, err = self._load({"fillers": [], "replacements": {},
+                                       "profiles": {"good": {}, "bad": bad}})
+                self.assertEqual(list(cfg["profiles"]), ["good"])
+                self.assertIn("malformed profile 'bad'", err)
+
+    def test_replacements_with_non_string_values_skip_entry(self):
+        cfg, err = self._load({
+            "fillers": [], "replacements": {},
+            "profiles": {"code": {"replacements": {"todo": 5}}},
+        })
+        self.assertEqual(cfg["profiles"], {})
+        self.assertIn("malformed profile 'code'", err)
+
+    def test_explicit_default_entry_ignored_with_warning(self):
+        cfg, err = self._load({
+            "fillers": [], "replacements": {},
+            "profiles": {"default": {"convert_currency": False}},
+        })
+        self.assertEqual(cfg["profiles"], {})
+        self.assertIn("ignoring profiles['default']", err)
+
+    def test_empty_name_skipped(self):
+        # Note: JSON object keys are always strings, so a non-string name can
+        # only reach _validated_profiles from hand-built dicts; via files the
+        # realistic bad case is an empty name.
+        cfg, _ = self._load({
+            "fillers": [], "replacements": {},
+            "profiles": {"": {"convert_currency": False}},
+        })
+        self.assertEqual(cfg["profiles"], {})
+
+    def test_wrong_typed_fillers_still_raises_for_daemon_guard(self):
+        # Pins the contract the daemon's reload guard relies on: load_config
+        # swallows JSON decode errors itself but a wrong-typed field RAISES,
+        # and the daemon keeps serving its last-good config when that happens.
+        with tempfile.TemporaryDirectory() as d:
+            base = self._write_base(d, {"fillers": 5})
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(TypeError):
+                    load_config(base, user_path=Path(d) / "none.json")
 
 
 class ConfigMtimeTests(unittest.TestCase):

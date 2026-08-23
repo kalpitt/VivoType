@@ -44,6 +44,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var setupController: SetupWindowController?
     private var isSetupRunning = false   // guards against a double-spawned setup_core.sh
     private var currentState: VivoTypeState = .idle
+    private var lastErrorDetail: String?  // shown in the menu while state == .error
+    private var errorEpoch = 0            // invalidates a pending error auto-recovery
+    private var isDownloadingModel = false // drives the Settings "Network activity" readout
+    private var pendingCorrectionsCount = 0 // badge on the "Review corrections…" item
+    private var isCountingCorrections = false // one promote.py --list-json at a time
 
     // Hands-free (toggle) dictation: double-tap the hotkey to start a continuous
     // recording (no holding); double-tap or tap once again to stop + insert. Hold
@@ -113,6 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func beginFirstRunSetup() {
         let controller = SetupWindowController()
         controller.waitsForModel = true   // hold Success until the model is live
+        controller.hotkeyLabel = settings.hotkeyLabel
         controller.onRunSetup = { [weak self] in self?.runSetupScript() }
         // setup_core.sh exited 0 → wire the backend + daemon NOW so the model
         // downloads/loads on the onboarding screen, not after the handoff.
@@ -250,6 +256,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setState(_ state: VivoTypeState) {
+        // A CLI-fallback completion (Dictation's finish closure) calls
+        // onState?(.idle) unconditionally once a transcription resolves —
+        // including the very request whose timeout just triggered a daemon
+        // hang-restart. If that lands between the restart's .loading and
+        // .ready status deliveries, don't let it downgrade the visual state:
+        // isDaemonLoading (set only by the daemon's own onStatusChange) is
+        // the source of truth the hotkey gate already trusts, and the menu
+        // bar must agree with it rather than flash "Ready" while the hotkey
+        // is still silently disabled underneath.
+        if state == .idle && isDaemonLoading { return }
+        // setState is re-entered on every audio-level tick's side effects, so the
+        // sound-only cues below must fire on transitions only, never repeatedly.
+        let previousState = currentState
         currentState = state
         let symbol: String
         let tint: NSColor?
@@ -261,6 +280,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .idle:         customImage = brandWaveTemplate; symbol = "mic"; tint = nil; currentStatus = "Ready"
         case .recording:    symbol = "waveform";                tint = nil;                   currentStatus = "Recording…"
         case .transcribing: symbol = "waveform";                tint = nil;                   currentStatus = "Transcribing…"
+        // Note: every Dictation .error site (temp-file open, engine start,
+        // handleConfigChange) has ALREADY stopped the capture, so the ⚠ here is
+        // honest even while the hotkey is still held — and the 5s auto-recovery
+        // below is the ONLY thing that clears it, because the eventual hotkey
+        // release hits `guard isRecording` in both stopAndTranscribe() and
+        // cancel() and emits no further state. Don't make this conditional.
         case .error:        symbol = "exclamationmark.triangle"; tint = .systemOrange;        currentStatus = "Error"
         case .loading:      symbol = "ellipsis";                tint = nil;                   // currentStatus set by startDaemon/reload
         }
@@ -277,13 +302,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         rebuildMenu()
 
+        // HUD-less ("sound-only") mode suppresses the recording pill and replaces
+        // it with a start/stop cue, for users who don't want an overlay on screen.
+        // It deliberately does NOT suppress the ⚠ warning toast — that toast
+        // carries information a silent failure would otherwise lose.
+        let showHUD = settings.hudEnabled
         switch state {
         case .recording:
-            pill?.setMode(handsFree: isHandsFree)  // distinct badge for hands-free
-            pill?.show()
+            if showHUD {
+                pill?.setMode(handsFree: isHandsFree)  // distinct badge for hands-free
+                pill?.show()
+            } else if state != previousState {
+                playHUDlessCue("Tink")
+            }
+        case .transcribing:
+            if showHUD {
+                pill?.setProcessing()  // stays up during the split-second of ASR
+                pill?.show()
+            } else if state != previousState {
+                playHUDlessCue("Purr")
+            }
         default:
             pill?.hide()
         }
+
+        // Transient errors (device unplugged mid-capture, one failed injection)
+        // must not leave a scary permanent ⚠ in the menu bar — the app still
+        // works. Auto-recover to idle after a few seconds; any state change in
+        // between (new recording, daemon loading) invalidates the revert.
+        if state == .error {
+            errorEpoch += 1
+            let epoch = errorEpoch
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self = self, self.currentState == .error,
+                      self.errorEpoch == epoch else { return }
+                self.lastErrorDetail = nil  // don't pin an old message on a future error
+                self.setState(.idle)
+            }
+        }
+    }
+
+    /// Start/stop cue for sound-only mode — the only feedback the user gets once
+    /// the pill is hidden. Gated on the sound preference so "no pill, no sound"
+    /// stays reachable. "Pop" is reserved for the correction-captured cue
+    /// (Dictation.swift) and is deliberately not reused here.
+    private func playHUDlessCue(_ name: String) {
+        guard settings.soundEnabled else { return }
+        NSSound(named: name)?.play()
     }
 
     /// Cached VivoType brand-wave menu-bar template (idle state). Loaded from the
@@ -310,6 +375,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         header.isEnabled = false
         header.image = statusSymbol()  // colored dot reflecting the live state
         menu.addItem(header)
+        // "Error" alone is undebuggable — show what actually went wrong.
+        if currentState == .error, let detail = lastErrorDetail, !detail.isEmpty {
+            let detailItem = NSMenuItem(title: "⚠ " + String(detail.prefix(70)),
+                                        action: nil, keyEquivalent: "")
+            detailItem.isEnabled = false
+            detailItem.toolTip = detail
+            menu.addItem(detailItem)
+        }
         menu.addItem(.separator())
 
         menu.addItem(NSMenuItem(title: isPaused ? "Resume listening" : "Pause listening",
@@ -324,21 +397,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         handsFree.isEnabled = isHandsFree || (!isPaused && !isDaemonLoading)
         menu.addItem(handsFree)
 
-        menu.addItem(NSMenuItem(title: "Review corrections…",
+        // Corrections you've made sit unreviewed until you open this window, with
+        // nothing in the UI to say so. The count makes that queue visible.
+        menu.addItem(NSMenuItem(title: correctionsMenuTitle(),
                                 action: #selector(reviewCorrections), keyEquivalent: ""))
 
         // Model picker — checkmark on the active model; switching reloads the daemon.
         let modelItem = NSMenuItem(title: "Model", action: nil, keyEquivalent: "")
         let modelMenu = NSMenu()
-        for name in ["small.en", "tiny.en"] {
-            let item = NSMenuItem(title: name, action: #selector(selectModel(_:)), keyEquivalent: "")
+        var options = ModelCatalog.all
+        // A model set outside the UI (CLI, hand-edited config) still gets a row,
+        // so the submenu never looks like nothing is selected.
+        if !options.contains(where: { $0.id == settings.model }) {
+            options.append(ModelOption(label: ModelCatalog.label(for: settings.model),
+                                       id: settings.model))
+        }
+        for option in options {
+            let item = NSMenuItem(title: option.label, action: #selector(selectModel(_:)), keyEquivalent: "")
             item.target = self
-            item.state = (settings.model == name) ? .on : .off
+            item.state = (settings.model == option.id) ? .on : .off
+            // The model id travels on the item, never in its title — the title is
+            // now a display label and can't be parsed back into an id.
+            item.representedObject = option.id
             modelMenu.addItem(item)
         }
         modelItem.submenu = modelMenu
         menu.addItem(modelItem)
         menu.addItem(.separator())
+        // The way out of a stuck backend without force-quitting the app: drops
+        // the daemon (dead or alive) and starts a fresh one.
+        menu.addItem(NSMenuItem(title: "Restart speech engine",
+                                action: #selector(restartBackend), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(.separator())
         if let version = vivotypeVersion() {
@@ -349,7 +438,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Quit VivoType", action: #selector(quit), keyEquivalent: "q"))
 
         for item in menu.items where item.action != nil { item.target = self }
+        menu.delegate = self
         statusItem?.menu = menu
+    }
+
+    private func correctionsMenuTitle() -> String {
+        pendingCorrectionsCount > 0
+            ? "Review corrections… (\(pendingCorrectionsCount))"
+            : "Review corrections…"
+    }
+
+    /// Count the corrections waiting in the review queue, off the main thread —
+    /// promote.py is a Python subprocess and must never block the menu opening.
+    /// Uses the same `--list-json` contract ReviewController already relies on.
+    private func refreshCorrectionsCount() {
+        guard let python = pythonPath, let promote = promotePath, !promote.isEmpty,
+              !isCountingCorrections else { return }
+        isCountingCorrections = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = runProcess(python, [promote, "--list-json"], timeout: 60)
+            let count: Int = {
+                guard result.status == 0, let data = result.stdout.data(using: .utf8),
+                      let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+                else { return 0 }
+                return array.count
+            }()
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.isCountingCorrections = false
+                guard count != self.pendingCorrectionsCount else { return }
+                self.pendingCorrectionsCount = count
+                // Retitle the live item rather than calling rebuildMenu(): this
+                // completion usually lands while the menu is on screen (it was
+                // triggered by menuWillOpen), and swapping statusItem.menu out
+                // from under an open menu is not safe. The stored count is what
+                // the next rebuildMenu() renders.
+                self.statusItem?.menu?.items
+                    .first { $0.action == #selector(self.reviewCorrections) }?
+                    .title = self.correctionsMenuTitle()
+            }
+        }
     }
 
     /// A small status dot for the menu header, tinted by the live app state.
@@ -400,9 +528,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         controller.onCaptured = { [weak self] count in
-            guard let self = self, self.settings.toastEnabled else { return }
+            guard let self = self else { return }
+            // Refresh regardless of the toast preference — the badge is the only
+            // signal a user with toasts off gets that the queue grew.
+            self.refreshCorrectionsCount()
+            guard self.settings.toastEnabled else { return }
             let message = count > 1 ? "✓ \(count) corrections captured" : "✓ Correction captured"
             self.toast?.show(message)
+        }
+        // Not gated on toastEnabled: without it the text silently vanishes and
+        // the user has no idea their words are one ⌘V away.
+        controller.onInjectBlocked = { [weak self] message in
+            self?.toast?.show("⚠ " + message)
+        }
+        // Same reasoning: a device swap mid-dictation discards the clip, and
+        // the ⚠ glyph alone doesn't say words were lost or why it appeared.
+        controller.onCaptureLost = { [weak self] message in
+            self?.toast?.show("⚠ " + message)
+        }
+        controller.onInjected = { [weak self] text in
+            self?.setupController?.notePracticeTranscript(text)
         }
         controller.soundEnabled = settings.soundEnabled
 
@@ -410,17 +555,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // if the daemon is still loading, crashed, or hasn't started yet.
         controller.onTranscribe = { [weak self] url, completion in
             guard let self = self else { completion(nil); return }
+            // Per-app context resolves HERE — at transcribe start, i.e. the app
+            // about to receive the text — not at injection time. The same name
+            // feeds the daemon AND the CLI fallback so a degraded retry applies
+            // identical rules.
+            let profile = self.resolvedProfile()
             if let daemon = self.daemonClient {
                 let prompt = self.buildInitialPrompt()
-                daemon.transcribe(wav: url, initialPrompt: prompt) { [weak self] text in
+                daemon.transcribe(wav: url, initialPrompt: prompt, profile: profile) { [weak self] text in
                     if let text = text {
                         completion(text)
                     } else {
-                        self?.runCliFallback(url: url, completion: completion)
+                        self?.runCliFallback(url: url, profile: profile, completion: completion)
                     }
                 }
             } else {
-                self.runCliFallback(url: url, completion: completion)
+                self.runCliFallback(url: url, profile: profile, completion: completion)
             }
         }
 
@@ -428,10 +578,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    private func runCliFallback(url: URL, completion: @escaping (String?) -> Void) {
+    /// The per-app context for a dictation happening NOW: the frontmost app's
+    /// bundle ID mapped through settings.app_profiles, defaulting to "default"
+    /// for unmapped/unknown apps. Bundle IDs are used only to look up this
+    /// mapping — they are never logged or shown.
+    private func resolvedProfile() -> String {
+        let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+        return settings.appProfiles[bundleID] ?? "default"
+    }
+
+    /// Profile names defined in core/postprocess_config.json's "profiles"
+    /// object, minus the implicit "default". Read live so JSON edits (the v1
+    /// way to define contexts) show up next time Settings opens.
+    private func availableProfileNames() -> [String] {
+        guard let url = vivotypeResourcesURL()?
+                .appendingPathComponent("core/postprocess_config.json"),
+              let data = FileManager.default.contents(atPath: url.path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let profiles = obj["profiles"] as? [String: Any]
+        else { return [] }
+        return profiles.keys.filter { $0 != "default" }.sorted()
+    }
+
+    private func runCliFallback(url: URL, profile: String,
+                                completion: @escaping (String?) -> Void) {
         guard let python = pythonPath, let cli = cliPath else { completion(nil); return }
+        let prompt = buildInitialPrompt()
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = runProcess(python, [cli, url.path], timeout: 300)
+            var args = [cli, url.path]
+            if !prompt.isEmpty {
+                args.append(contentsOf: ["--initial-prompt", prompt])
+            }
+            if profile != "default", !profile.hasPrefix("-") {
+                // A hand-edited name like "--no-clean" would otherwise be
+                // eaten as a CLI flag and drop the utterance on the fallback
+                // path; the daemon path needs no such guard (JSON field).
+                args.append(contentsOf: ["--profile", profile])
+            }
+            let result = runProcess(python, args, timeout: 300)
             let text = result.status == 0
                 ? result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
                 : nil
@@ -475,32 +659,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             switch status {
             case .loading(let downloading):
                 self.isDaemonLoading = true
+                self.isDownloadingModel = (downloading != nil)
                 self.currentStatus = downloading != nil ? "Downloading model…" : "Loading model…"
                 self.setState(.loading)
             case .ready:
                 self.isDaemonLoading = false
+                self.isDownloadingModel = false
+                self.lastErrorDetail = nil  // recovered — drop the stale detail
                 self.setState(.idle)
-                // Onboarding (if still showing) advances to Success only now —
-                // the menu-bar icon is live and dictation is genuinely ready.
+                // Onboarding (if still showing) advances to Practice / Success
+                // only now — the menu-bar icon is live and dictation is ready.
                 self.setupController?.modelDidBecomeReady()
             case .error(let msg):
                 self.isDaemonLoading = false
+                self.isDownloadingModel = false
                 warn("VivoType: daemon — \(msg). One-shot CLI fallback active.")
+                self.lastErrorDetail = msg  // surfaced in the menu if things stay broken
                 self.setState(.idle)  // still usable via CLI
                 self.setupController?.modelDidFail(
                     "Couldn't load the model. Check your internet connection and tap Retry.")
             }
         }
-        daemon.onTranscribeError = { [weak self] _ in
-            // Full message is in the warn log + daemon.log; the toast just makes
+        daemon.onTranscribeError = { [weak self] msg in            // Full message is in the warn log + daemon.log; the toast just makes
             // the failure visible while the CLI fallback retries the clip.
+            self?.lastErrorDetail = msg
             self?.toast?.show("⚠ Transcription error — retrying")
+        }
+        // Structural voice-edit commands ("scratch that"): the daemon has
+        // already returned empty text for that request, so Dictation's normal
+        // cleanup ran; this performs the actual edit in the target app.
+        daemon.onCommand = { [weak self] command in
+            self?.dictation?.executeCommand(command)
         }
         daemonClient = daemon
         isDaemonLoading = true
         currentStatus = "Loading model…"
         setState(.loading)
         daemon.start(pythonPath: python, repoRoot: root)
+    }
+
+    /// Whether a learned dictionary value is safe to feed Whisper as vocabulary.
+    /// Only proper-noun-shaped terms qualify: 3+ characters, not starting
+    /// lowercase, not ALLCAPS, no digits. On silence Whisper echoes its prompt
+    /// back, so a common lowercase word like "menu" in the prompt becomes text
+    /// typed out of thin air (the "VivoType, menu" bug). Uncased scripts
+    /// (Devanagari etc.) pass — they have no lowercase to check.
+    private func isPromptSafeTerm(_ term: String) -> Bool {
+        guard term.count >= 3 else { return false }
+        guard let first = term.first, !first.isLowercase else { return false }
+        guard !term.contains(where: { $0.isNumber }) else { return false }
+        let letters = term.filter { $0.isLetter }
+        if !letters.isEmpty && letters.allSatisfy({ $0.isUppercase }) { return false }
+        return true
     }
 
     /// Build a comma-delimited hint string from the user's active dictionary/lexicon
@@ -515,7 +725,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let data = FileManager.default.contents(atPath: dictPath),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let repls = obj["replacements"] as? [String: String] {
-            terms.append(contentsOf: repls.values.sorted())
+            terms.append(contentsOf: repls.values.filter(isPromptSafeTerm).sorted())
         }
 
         let lexPath = root + "/lexicon/contacts.json"
@@ -673,8 +883,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Shared push-to-talk handler for both the global and local flagsChanged monitors.
     private func handleHotkey(_ event: NSEvent) {
-        guard !self.isPaused, !self.isDaemonLoading,
-              event.keyCode == self.settings.hotkeyKeycode else { return }
+        guard event.keyCode == self.settings.hotkeyKeycode else { return }
         // A modifier key is "pressed" when its flag is now set, else released.
         let flags = event.modifierFlags
         let pressed: Bool
@@ -685,8 +894,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case 56, 60: pressed = flags.contains(.shift)
         default:     pressed = !flags.isEmpty
         }
-        if pressed { self.handleHotkeyPress() }
-        else { self.handleHotkeyRelease() }
+        // Press is gated (don't start capture while paused / model loading).
+        // Release is NOT — if the user paused mid-hold, we still must end the
+        // capture and transcribe rather than leaving the mic stuck on.
+        if pressed {
+            guard !self.isPaused, !self.isDaemonLoading else { return }
+            self.handleHotkeyPress()
+        } else {
+            self.handleHotkeyRelease()
+        }
     }
 
     /// Hotkey went DOWN. Routes between: stop hands-free, enter hands-free (2nd tap
@@ -765,6 +981,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: menu actions
 
+    /// Menu action: tear down the daemon client (crashed, wedged, or fine) and
+    /// spawn a fresh one — recovers from every "stuck at Error/Loading" state
+    /// that previously needed a force-quit. If the backend was never wired
+    /// (e.g. the .venv appeared after launch), retry the full launch path.
+    @objc private func restartBackend() {
+        lastErrorDetail = nil
+        if dictation == nil {
+            finishLaunch()
+            return
+        }
+        // Detach the old client's callbacks first: its EOF (fired when the old
+        // daemon exits, up to 2 s later) must not clobber the NEW daemon's
+        // loading state with a stale "daemon terminated" error.
+        daemonClient?.onStatusChange = nil
+        daemonClient?.onTranscribeError = nil
+        daemonClient?.onCommand = nil
+        daemonClient?.shutdown()
+        daemonClient = nil
+        startDaemon()
+    }
+
     @objc private func togglePause() {
         isPaused.toggle()
         // Pausing while dictating hands-free: insert what was captured, then pause.
@@ -776,7 +1013,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Switch the active transcription model from the menu's Model submenu, then
     /// reload the daemon so the change takes effect immediately.
     @objc private func selectModel(_ sender: NSMenuItem) {
-        let model = sender.title
+        guard let model = sender.representedObject as? String else { return }
         guard model != settings.model else { return }
         settings.model = model
         if let path = configPath { settings.save(to: path) }
@@ -852,6 +1089,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     daemon.reload(model: updated.model)
                 }
             }
+            // Privacy card readout: the only network activity this app ever has.
+            settingsController?.isDownloading = { [weak self] in self?.isDownloadingModel ?? false }
+            // Backup & Restore resolves data/user_dictionary.json and
+            // data/lexicon/contacts.json under the writable App Support root.
+            settingsController?.appSupportURL = { vivotypeAppSupportURL() }
+            // Contexts card: the popup lists profiles defined in the bundled
+            // postprocess_config.json ("default" is implicit, not listed).
+            settingsController?.definedProfileNames = { [weak self] in
+                self?.availableProfileNames() ?? []
+            }
+            // A restored dictionary/lexicon must reach the running backend: the
+            // daemon's initial_prompt is rebuilt per request from those files, and
+            // the badge count can change.
+            settingsController?.onImported = { [weak self] in
+                self?.refreshCorrectionsCount()
+            }
+        } else {
+            // Menu Model (and other live paths) may have changed AppDelegate.settings
+            // since this controller was created — refresh before showing so a
+            // Settings toggle can't silently write the stale model back.
+            settingsController?.reload(settings)
         }
         settingsController?.show()
     }
@@ -870,6 +1128,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = message
         alert.runModal()
         ActivationCoordinator.shared.end()
+    }
+}
+
+// MARK: - status-menu delegate
+
+extension AppDelegate: NSMenuDelegate {
+    /// Recount the review queue each time the menu opens, so the badge is current
+    /// without polling promote.py in the background all day. The count lands
+    /// asynchronously and retitles the item in place (see refreshCorrectionsCount).
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshCorrectionsCount()
     }
 }
 
