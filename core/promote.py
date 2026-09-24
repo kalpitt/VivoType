@@ -25,11 +25,13 @@ import sys
 from pathlib import Path
 
 try:  # sibling modules
-    from core.namematch import _edit_distance, _threshold, load_english_words, LEXICON_PATH
+    from core.learn import is_punctuation_pair
+    from core.namematch import _edit_distance, _threshold, correct_names, load_english_words, LEXICON_PATH
     from core.config import atomic_write_text
     from core.paths import corrections_log, user_dictionary
 except ImportError:
-    from namematch import _edit_distance, _threshold, load_english_words, LEXICON_PATH
+    from learn import is_punctuation_pair
+    from namematch import _edit_distance, _threshold, correct_names, load_english_words, LEXICON_PATH
     from config import atomic_write_text
     from paths import corrections_log, user_dictionary
 
@@ -49,9 +51,11 @@ def load_corrections(path):
         if not line:
             continue
         try:
-            items.append(json.loads(line))
+            item = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if isinstance(item, dict):
+            items.append(item)
     return items
 
 
@@ -115,10 +119,21 @@ def classify(frm, to, english):
         and to[:1].isupper() and to[1:].islower()
         and to.lower() not in english
     )
+    # Lexicon only when the fuzzy matcher itself would turn `frm` into `to`.
+    # Its own rules (capitalised input only, English words untouched, its
+    # distance threshold) differ from a bare edit distance, so a pair routed
+    # here on distance alone was reported promoted but never fired. A
+    # dictionary rule always fires.
     if " " not in frm and name_like:
-        if _edit_distance(frm.lower(), to.lower(), 3) <= _threshold(len(to)):
+        if correct_names(frm, names=[to], english=english) == to:
             return "lexicon"
     return "dictionary"
+
+
+def _promotion_refused(frm, to):
+    """A rule that turns a word into a bare symbol ("comma -> ,") is never
+    promoted: it would rewrite the real word everywhere. Words stay words."""
+    return is_punctuation_pair(frm, to)
 
 
 def _load_json_object(path):
@@ -144,21 +159,161 @@ def _load_json_object(path):
     return data
 
 
+def _require_rule_shapes(data, path):
+    """Refuse to rewrite a lexicon/dictionary whose arrays or map have the wrong
+    shape, rather than crash mid-edit or rewrite them as something else."""
+    for key in ("names", "learned", "learned_added"):
+        if key in data and not (isinstance(data[key], list)
+                                and all(isinstance(n, str) for n in data[key])):
+            raise ValueError(f"Refusing to modify '{path}': '{key}' is not a list of names.")
+    if "replacements" in data and not isinstance(data["replacements"], dict):
+        raise ValueError(f"Refusing to modify '{path}': 'replacements' is not an object.")
+
+
 def promote_to_lexicon(name, path):
     data = _load_json_object(path)
+    _require_rule_shapes(data, path)
     if not data:
         data = {"_comment": "Names lexicon for VivoType's fuzzy matcher.", "names": []}
     names = data.setdefault("names", [])
-    if name.lower() not in {n.lower() for n in names}:
+    added_name = name.lower() not in {n.lower() for n in names}
+    if added_name:
         names.append(name)
         names.sort(key=str.lower)
+    learned = data.setdefault("learned", [])
+    added_learned = name.lower() not in {n.lower() for n in learned}
+    if added_learned:
+        learned.append(name)
+        learned.sort(key=str.lower)
+    # Names learning put into `names` (not ones that were already contacts),
+    # so deleting a learned name later never removes a real contact.
+    if added_name:
+        learned_added = data.setdefault("learned_added", [])
+        if name.lower() not in {n.lower() for n in learned_added}:
+            learned_added.append(name)
+            learned_added.sort(key=str.lower)
     atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return added_name, added_learned
 
 
 def promote_to_dictionary(frm, to, path):
+    """Write the rule; return the value it replaced (None if the key was new)."""
     data = _load_json_object(path)
-    data.setdefault("replacements", {})[frm.lower()] = to
+    _require_rule_shapes(data, path)
+    replacements = data.setdefault("replacements", {})
+    previous = replacements.get(frm.lower())
+    replacements[frm.lower()] = to
     atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return previous
+
+
+def revert_lexicon(undo, path):
+    """Undo one lexicon promotion: remove only what that promotion added, so a
+    name that was already there (e.g. imported from Contacts) survives.
+
+    A name leaves `names` only while it is still in `learned`: the first Undo
+    clears `learned`, so replaying the same token cannot delete a name that
+    came back since. Tokens are still single-use by contract."""
+    data = _load_json_object(path)
+    _require_rule_shapes(data, path)
+    low = undo["name"].strip().lower()
+    still_learned = low in {str(n).lower() for n in data.get("learned", [])}
+    changed = False
+    for key, flag in (("names", "added_name"), ("learned", "added_learned"),
+                      ("learned_added", "added_name")):
+        if key == "names" and not still_learned:
+            continue
+        if undo[flag] and key in data:
+            kept = [n for n in data[key] if str(n).lower() != low]
+            changed = changed or len(kept) != len(data[key])
+            data[key] = kept
+    if changed:
+        atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return "reverted" if changed else "nothing_to_undo"
+
+
+def revert_dictionary(undo, path):
+    """Undo one dictionary promotion: restore the value it replaced, or drop the
+    key if it was new. Leaves the rule alone if it changed since the promotion."""
+    data = _load_json_object(path)
+    _require_rule_shapes(data, path)
+    replacements = data.get("replacements", {})
+    key = undo["key"]
+    if replacements.get(key) != undo["to"]:
+        return "changed_since"
+    if undo["previous"] is None:
+        replacements.pop(key)
+    else:
+        replacements[key] = undo["previous"]
+    atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return "reverted"
+
+
+def list_rules(lexicon_path, config_path):
+    """The user's active rules, for the Review window: every personal
+    dictionary replacement, and every name learning added."""
+    rules = []
+    config = _load_json_object(config_path)
+    replacements = config.get("replacements", {})
+    if isinstance(replacements, dict):
+        rules = [{"from": k, "to": v} for k, v in replacements.items() if isinstance(v, str)]
+        rules.sort(key=lambda r: r["from"].lower())
+    lexicon = _load_json_object(lexicon_path)
+    learned = lexicon.get("learned", [])
+    names = sorted((n for n in learned if isinstance(n, str)), key=str.lower) \
+        if isinstance(learned, list) else []
+    return {"rules": rules, "names": names}
+
+
+def delete_rule(frm, to, path):
+    """Delete one dictionary rule, only if it still reads frm -> to."""
+    data = _load_json_object(path)
+    _require_rule_shapes(data, path)
+    replacements = data.get("replacements", {})
+    # The key as listed (a hand-edited "Foo" stays "Foo"), else the
+    # lowercased form promote writes.
+    key = frm if frm in replacements else frm.strip().lower()
+    if key not in replacements:
+        return "not_found"
+    if replacements[key] != to:
+        return "changed_since"
+    replacements.pop(key)
+    atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return "deleted"
+
+
+def delete_name(name, path):
+    """Forget one learned name. It leaves `names` only when learning added
+    it (`learned_added`); a name that was already a contact stays."""
+    data = _load_json_object(path)
+    _require_rule_shapes(data, path)
+    low = name.strip().lower()
+    if low not in {str(n).lower() for n in data.get("learned", [])}:
+        return "not_found", False
+    added = low in {str(n).lower() for n in data.get("learned_added", [])}
+    keys = ("learned", "learned_added", "names") if added else ("learned",)
+    for key in keys:
+        if key in data:
+            data[key] = [n for n in data[key] if str(n).lower() != low]
+    atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return "deleted", added
+
+
+def _undo_token_valid(undo):
+    """Shape check for a token that arrives as JSON on argv."""
+    rows = undo.get("rows", [])
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        return False
+    if undo.get("target") == "lexicon":
+        return (isinstance(undo.get("name"), str) and undo["name"].strip() != ""
+                and isinstance(undo.get("added_name"), bool)
+                and isinstance(undo.get("added_learned"), bool))
+    if undo.get("target") == "dictionary":
+        return (isinstance(undo.get("key"), str) and undo["key"] != ""
+                and isinstance(undo.get("to"), str)
+                and "previous" in undo
+                and (undo["previous"] is None or isinstance(undo["previous"], str)))
+    return False
 
 
 def rewrite_log(path, entries):
@@ -168,21 +323,72 @@ def rewrite_log(path, entries):
     atomic_write_text(path, body)
 
 
-def apply_one(action, frm, to, log_path, lexicon_path, config_path, english=None):
-    """Apply a single promote/discard to one from->to group (used by the GUI)."""
+def apply_one(action, frm, to, log_path, lexicon_path, config_path, english=None,
+              allow_unlogged=False, undo=None):
+    """Apply a single promote/discard/remove to one from->to group (used by the GUI).
+
+    A promote returns an `undo` token describing exactly what it changed,
+    including the review-queue rows it consumed. `remove` requires that token
+    and reverses only that change. Callers must use each token at most once."""
+    frm = frm.strip()
+    to = to.strip()
     items = load_corrections(log_path)
-    key = (frm.strip().lower(), to.strip())
+    key = (frm.lower(), to)
 
     def group_key(it):
         return (str(it.get("from", "")).strip().lower(), str(it.get("to", "")).strip())
 
     matched = [it for it in items if group_key(it) == key]
     rest = [it for it in items if group_key(it) != key]
-    if not matched:
+
+    if action in ("delete-rule", "delete-name"):
+        try:
+            if action == "delete-rule":
+                status, from_names = delete_rule(frm, to, config_path), False
+            else:
+                status, from_names = delete_name(to, lexicon_path)
+        except ValueError as exc:
+            return {"ok": False, "status": "write_failed", "error": str(exc)}
+        return {"ok": status == "deleted", "action": action, "status": status,
+                "removed_from_names": from_names}
+
+    if action == "remove":
+        if not isinstance(undo, dict):
+            return {"ok": False, "status": "undo_required"}
+        if not _undo_token_valid(undo):
+            return {"ok": False, "status": "undo_invalid"}
+        target = undo["target"]
+        if target == "lexicon":
+            matches = undo["name"].strip().lower() == to.lower()
+        else:
+            matches = undo["key"] == frm.lower() and undo["to"] == to
+        if not matches:
+            return {"ok": False, "status": "undo_mismatch"}
+        try:
+            if target == "lexicon":
+                status = revert_lexicon(undo, lexicon_path)
+            else:
+                status = revert_dictionary(undo, config_path)
+        except ValueError as exc:
+            return {"ok": False, "status": "write_failed", "error": str(exc)}
+        if status == "changed_since":
+            return {"ok": False, "action": action, "target": target, "status": status,
+                    "restored": 0}
+        # Put back the review-queue rows the promote consumed, once each.
+        missing = [r for r in undo.get("rows", []) if r not in items]
+        if missing:
+            rewrite_log(log_path, items + missing)
+        return {"ok": True, "action": action, "target": target, "status": status,
+                "restored": len(missing)}
+
+    if not matched and not (action == "promote" and allow_unlogged):
         return {"ok": False, "status": "not_found"}
 
     target = None
+    undo_token = None
     if action == "promote":
+        if _promotion_refused(frm, to):
+            return {"ok": False, "status": "refused_punctuation", "target": None}
         # Deliberately NOT risk-gated: --apply is the per-rule path where the
         # user has already seen the ⚠ warning in the Review UI and chosen to
         # promote anyway. Only BULK promotion refuses risky rules.
@@ -191,15 +397,25 @@ def apply_one(action, frm, to, log_path, lexicon_path, config_path, english=None
         target = classify(frm, to, english)
         try:
             if target == "lexicon":
-                promote_to_lexicon(to, lexicon_path)
+                added_name, added_learned = promote_to_lexicon(to, lexicon_path)
+                undo_token = {"target": "lexicon", "name": to,
+                              "added_name": added_name, "added_learned": added_learned,
+                              "rows": matched}
             else:
-                promote_to_dictionary(frm, to, config_path)
+                previous = promote_to_dictionary(frm, to, config_path)
+                undo_token = {"target": "dictionary", "key": frm.lower(), "to": to,
+                              "previous": previous, "rows": matched}
         except ValueError as exc:
             # Promotion failed (e.g. a corrupt target file). Keep the corrections
             # in the log so the user can retry after fixing the file.
             return {"ok": False, "status": "write_failed", "error": str(exc)}
-    rewrite_log(log_path, rest)  # both promote and discard remove the entries
-    return {"ok": True, "action": action, "target": target, "removed": len(matched)}
+    if matched:
+        rewrite_log(log_path, rest)  # both promote and discard remove the entries
+    result = {"ok": True, "action": action, "target": target,
+              "removed": len(matched)}
+    if undo_token is not None:
+        result["undo"] = undo_token
+    return result
 
 
 def main(argv=None):
@@ -218,8 +434,28 @@ def main(argv=None):
     parser.add_argument("--apply", action="store_true", help="Apply one action (with --from/--to/--action).")
     parser.add_argument("--from", dest="from_word", help="The misrecognized word (with --apply).")
     parser.add_argument("--to", dest="to_word", help="The correct word (with --apply).")
-    parser.add_argument("--action", choices=["promote", "discard"], help="Action for --apply.")
+    parser.add_argument("--action",
+                        choices=["promote", "discard", "remove", "delete-rule", "delete-name"],
+                        help="Action for --apply. delete-rule/delete-name take no undo "
+                             "token: they delete an active rule from the Review window.")
+    parser.add_argument("--list-rules-json", action="store_true",
+                        help="Print the active dictionary rules and learned names as JSON.")
+    parser.add_argument("--allow-unlogged", action="store_true",
+                        help="With --apply promote, write the rule even when no log row exists.")
+    parser.add_argument("--undo", help="With --apply remove: the JSON `undo` token a promote returned.")
+    parser.add_argument("--stdin-json", action="store_true",
+                        help="With --apply: read {\"from\", \"to\", \"undo\"?} as a JSON object on "
+                             "stdin instead of --from/--to/--undo, so the words (and the "
+                             "undo token's log rows) never appear on the command line.")
     args = parser.parse_args(argv)
+
+    if args.list_rules_json:
+        try:
+            print(json.dumps(list_rules(args.lexicon, args.config), ensure_ascii=False))
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        return 0
 
     if args.list_json:
         english = _load_english_or_warn()
@@ -229,16 +465,43 @@ def main(argv=None):
             risky, reason = assess_risk(g["from"], g["to"], g["count"], english)
             payload.append({"from": g["from"], "to": g["to"], "count": g["count"],
                             "target": classify(g["from"], g["to"], english),
-                            "risky": risky, "risk_reason": reason})
+                            "risky": risky, "risk_reason": reason,
+                            # Old log rows can hold pairs promote now refuses;
+                            # the Review UI offers only Discard for them.
+                            "refused": _promotion_refused(g["from"], g["to"])})
         print(json.dumps(payload, ensure_ascii=False))
         return 0
 
     if args.apply:
+        raw_undo = args.undo
+        if args.stdin_json:
+            try:
+                payload = json.loads(sys.stdin.read())
+            except (ValueError, RecursionError):  # JSONDecodeError is a ValueError
+                payload = None
+            if not (isinstance(payload, dict)
+                    and isinstance(payload.get("from"), str)
+                    and isinstance(payload.get("to"), str)):
+                print("error: --stdin-json needs a JSON object with string "
+                      "\"from\" and \"to\" on stdin", file=sys.stderr)
+                return 2
+            args.from_word, args.to_word = payload["from"], payload["to"]
+            raw_undo = payload.get("undo")
         if not (args.from_word and args.to_word and args.action):
             print("error: --apply requires --from, --to, and --action", file=sys.stderr)
             return 2
+        undo = None
+        if isinstance(raw_undo, dict):
+            undo = raw_undo
+        elif raw_undo:
+            try:
+                undo = json.loads(raw_undo)
+            except (TypeError, ValueError, RecursionError):  # JSONDecodeError is a ValueError
+                print("error: --undo must be JSON", file=sys.stderr)
+                return 2
         result = apply_one(args.action, args.from_word, args.to_word,
-                           args.log, args.lexicon, args.config)
+                           args.log, args.lexicon, args.config,
+                           allow_unlogged=args.allow_unlogged, undo=undo)
         print(json.dumps(result, ensure_ascii=False))
         return 0
 
@@ -272,6 +535,10 @@ def main(argv=None):
                 print("  " + summary + "\n  → skipped (risky)")
                 kept.extend(group["entries"])
                 continue
+            if _promotion_refused(group["from"], group["to"]):
+                print("  " + summary + "\n  → skipped (punctuation target)")
+                kept.extend(group["entries"])
+                continue
             choice = "y"
             print("  " + summary + "  → promoting")
         else:
@@ -280,6 +547,10 @@ def main(argv=None):
             ).strip().lower()
 
         if choice == "y":
+            if _promotion_refused(group["from"], group["to"]):
+                print("  ! skipped — symbol target")
+                kept.extend(group["entries"])
+                continue
             try:
                 if target == "lexicon":
                     promote_to_lexicon(group["to"], args.lexicon)

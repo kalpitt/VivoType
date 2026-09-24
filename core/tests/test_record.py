@@ -67,6 +67,36 @@ class RecordWriteTests(unittest.TestCase):
             self.assertEqual(rows[0]["label"], "hello world")
             self.assertTrue(rows[0]["filename"].startswith("raw/"))
 
+    def test_stereo_recording_is_downmixed_to_mono(self):
+        # A-F10: --channels 2 wrote interleaved L/R samples under a mono
+        # header — a clip of double length at half speed. The saved file
+        # must be true mono with one sample per frame.
+        import wave
+        n = 1600
+        left = np.full(n, 1000, dtype=np.int16)
+        right = np.full(n, 3000, dtype=np.int16)
+        stereo = np.column_stack([left, right])
+        with tempfile.TemporaryDirectory() as d:
+            data = Path(d)
+            outdir = data / "raw"
+            labels = data / "labels.csv"
+            with mock.patch.dict(sys.modules, {"sounddevice": mock.Mock()}), \
+                 mock.patch.object(record, "_record", return_value=(stereo, 0.1)), \
+                 mock.patch.object(record, "_labels_csv", return_value=labels), \
+                 mock.patch.object(record, "_default_raw_dir", return_value=outdir):
+                rc = record.main(["--label", "st", "--duration", "0.1",
+                                  "--channels", "2"])
+            self.assertEqual(rc, 0)
+            wav_path = next(outdir.glob("st-*.wav"))
+            with wave.open(str(wav_path), "rb") as wf:
+                self.assertEqual(wf.getnchannels(), 1)
+                self.assertEqual(wf.getnframes(), n)
+                pcm = np.frombuffer(wf.readframes(n), dtype=np.int16)
+            with labels.open(encoding="utf-8") as fh:
+                row = next(csv.DictReader(fh))
+        np.testing.assert_allclose(pcm, 2000, atol=1)
+        self.assertEqual(row["channels"], "1")  # describes the saved file
+
 
 if __name__ == "__main__":
     unittest.main()

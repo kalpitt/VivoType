@@ -127,11 +127,60 @@ class CommandDetectionTests(unittest.TestCase):
         self.assertIsNone(signal)
         self.assertEqual(remaining, "um scratch that")
 
+    def test_phrase_inside_noun_phrase_is_content(self):
+        # A sentence that merely ENDS with a command phrase used as ordinary
+        # words must type in full ("The metro opened a" + newline lost words).
+        for text in ("The metro opened a new line.",
+                     "I rewrote the new paragraph.",
+                     "Check out my new line",
+                     "Don't forget to cap that.",
+                     "Remember to make that a bullet list",
+                     "They launched a whole new line."):
+            with self.subTest(text=text):
+                signal, remaining, transform = detect_command(text)
+                self.assertIsNone(signal)
+                self.assertEqual(remaining, text)
+                self.assertEqual(transform, TRANSFORM_NONE)
+
+    def test_command_after_sentence_mark_still_detected(self):
+        # "that." ends a sentence, so the phrase after it is a command even
+        # though "that" alone would read as a determiner.
+        signal, remaining, transform = detect_command("I like that. New line")
+        self.assertEqual(remaining, "I like that.")
+        self.assertEqual(transform, "newline")
+
+    def test_standalone_transform_phrase(self):
+        for text, expected in (("new line", "newline"), ("New paragraph.", "newpara")):
+            with self.subTest(text=text):
+                signal, remaining, transform = detect_command(text)
+                self.assertIsNone(signal)
+                self.assertEqual(remaining, "")
+                self.assertEqual(transform, expected)
+
     def test_unicode_content_with_trailing_command(self):
         signal, remaining, transform = detect_command("मैं बाज़ार गया new line")
         self.assertIsNone(signal)
         self.assertEqual(remaining, "मैं बाज़ार गया")
         self.assertEqual(transform, "newline")
+
+
+class ContentPrecederReviewTests(unittest.TestCase):
+    """The determiner guard applies only to phrases that can be ordinary
+    content ("new line", "new paragraph", "cap that"), and "that" is not a
+    determiner guard ("send that new line" is a command)."""
+
+    def test_unambiguous_commands_always_fire(self):
+        self.assertEqual(detect_command("Let's finalize this all caps that")[2], "upper")
+        self.assertEqual(detect_command("Please review this make that a bullet list")[2],
+                         "bullet")
+
+    def test_that_before_new_line_is_a_command(self):
+        self.assertEqual(detect_command("Send that new line"), (None, "Send that", "newline"))
+        self.assertEqual(detect_command("I love that new line")[2], "newline")
+
+    def test_noun_phrase_stays_content(self):
+        self.assertEqual(detect_command("the metro opened a new line")[2], TRANSFORM_NONE)
+        self.assertEqual(detect_command('He said "the new line"')[2], TRANSFORM_NONE)
 
 
 class TransformTests(unittest.TestCase):
@@ -173,9 +222,15 @@ class TransformTests(unittest.TestCase):
         self.assertEqual(apply_transform("as dictated", "unknown-token"), "as dictated")
 
     def test_empty_remainder_never_crashes(self):
-        for transform in ("upper", "cap", "bullet", "newpara", "newline"):
+        for transform in ("upper", "cap", "bullet"):
             with self.subTest(transform=transform):
                 self.assertEqual(apply_transform("", transform), "")
+
+    def test_standalone_newline_commands_still_insert_breaks(self):
+        # Saying just "new line" / "new paragraph" must type the break itself,
+        # not nothing (the old test above pinned "" for these two).
+        self.assertEqual(apply_transform("", "newline"), "\n")
+        self.assertEqual(apply_transform("", "newpara"), "\n\n")
 
 
 if __name__ == "__main__":

@@ -10,13 +10,24 @@
 #   gate_path_absent_from_history "$MIRROR_DIR" "context/"
 #   gate_canary_absent_from_history "$MIRROR_DIR" "MYPROJECT-PRIVATE-CANARY-xxxx"
 #   gate_confirm "Push to public remote?"
+#
+# Every gate FAILS CLOSED: if git itself errors (wrong dir, bad pathspec,
+# argument list too long), the gate exits 1. A gate that cannot run must never
+# read as "nothing found".
 
-# gate_path_absent_from_history <repo_dir> <path>
+# gate_path_absent_from_history <repo_dir> <path> [<exclude-pathspec>...]
 # Dies if <path> appears anywhere in <repo_dir>'s git history (not just the working tree —
-# deleting a folder doesn't remove it from old commits).
+# deleting a folder doesn't remove it from old commits). Extra arguments are git pathspecs,
+# e.g. ':(exclude)core/data/README.md', to allowlist files inside <path>.
 gate_path_absent_from_history() {
-  local repo_dir="$1" path="$2"
-  if [ -n "$(git -C "$repo_dir" log --all --oneline -- "$path" 2>/dev/null || true)" ]; then
+  local repo_dir="$1" path="$2" out
+  shift 2
+  if ! out="$(git -C "$repo_dir" log --all --oneline -- "$path" "$@" 2>&1)"; then
+    echo "GATE FAILED: could not read mirror history ($repo_dir):" >&2
+    echo "$out" | sed 's/^/        /' >&2
+    exit 1
+  fi
+  if [ -n "$out" ]; then
     echo "GATE FAILED: '$path' still present in mirror history ($repo_dir)." >&2
     exit 1
   fi
@@ -26,12 +37,22 @@ gate_path_absent_from_history() {
 # Dies if <canary_string> appears in any blob of any commit in <repo_dir>. Plant the canary
 # string in a private-only file (e.g. context/STATE.md) so a hit can ONLY mean private content
 # leaked into the mirror — never a false positive from legitimate public wording.
+# git grep exits 0 on a hit, 1 on no hit, and anything else on an error — only 1 is clean.
 gate_canary_absent_from_history() {
-  local repo_dir="$1" canary="$2"
-  if git -C "$repo_dir" grep -l "$canary" $(git -C "$repo_dir" rev-list --all) >/dev/null 2>&1; then
-    echo "GATE FAILED: canary string found in mirror history ($repo_dir) — private content leaked." >&2
+  local repo_dir="$1" canary="$2" revs rc=0
+  if ! revs="$(git -C "$repo_dir" rev-list --all)"; then
+    echo "GATE FAILED: could not list mirror history ($repo_dir)." >&2
     exit 1
   fi
+  # shellcheck disable=SC2086  # one argument per revision, by design
+  git -C "$repo_dir" grep -l "$canary" $revs >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) echo "GATE FAILED: canary string found in mirror history ($repo_dir) — private content leaked." >&2
+       exit 1 ;;
+    1) ;;  # searched everything, found nothing
+    *) echo "GATE FAILED: git grep errored (exit $rc) scanning mirror history ($repo_dir)." >&2
+       exit 1 ;;
+  esac
 }
 
 # gate_confirm <prompt>
@@ -63,9 +84,13 @@ gate_confirm() {
 gate_no_local_paths_in_content() {
   local repo_dir="$1"
   local pattern='/(Users|home)/[A-Za-z0-9_.-]+/'
-  local hits
-  hits="$(git -C "$repo_dir" grep -InE "$pattern" -- . 2>/dev/null \
-    | grep -Ev ':scripts/drift_check\.sh:' || true)"
+  local raw hits rc=0
+  raw="$(git -C "$repo_dir" grep -InE "$pattern" -- . 2>/dev/null)" || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    echo "GATE FAILED: git grep errored (exit $rc) scanning $repo_dir for local paths." >&2
+    exit 1
+  fi
+  hits="$(printf '%s\n' "$raw" | grep -Ev ':scripts/drift_check\.sh:' || true)"
   if [ -n "$hits" ]; then
     echo "GATE FAILED: hardcoded local filesystem path (/Users/... or /home/...) found in $repo_dir:" >&2
     echo "$hits" | sed 's/^/        /' >&2

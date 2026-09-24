@@ -11,7 +11,11 @@ You need Xcode Command Line Tools (`xcode-select --install`) — present if `swi
 open clients/mac/build/VivoType.app     # or drag VivoType.app into /Applications first
 ```
 
-The app is **self-contained** — you do **not** need to set up the Python backend by hand. On first launch VivoType shows a **“Welcome to VivoType”** window and builds its own engine under `~/Library/Application Support/VivoType/` (a `.venv`, the model, your data, logs). This needs **Python 3.11+**; if it's missing, VivoType shows an install hint and a **Retry** button.
+The app is **self-contained** — you do **not** need to set up the Python backend by hand. On first launch VivoType shows a **“Welcome to VivoType”** window and builds its own engine under `~/Library/Application Support/VivoType/` (a `.venv`, the model, your data, logs). This needs **Python 3.11+** (native arm64 on Apple Silicon); if it's missing, VivoType shows an install hint and a **Retry** button. If setup fails, the window shows where the full log is (`~/Library/Application Support/VivoType/logs/setup.log`).
+
+Setup counts as finished only when `setup_core.sh` completes: its last step writes `.venv/.vivotype-setup-complete`, a copy of the `requirements.txt` it installed. If that marker is missing or doesn't match the app's `requirements.txt` (an interrupted install, or an update that changed dependencies), VivoType checks the existing `.venv` in the background (`setup_core.sh --check`). A `.venv` that already satisfies the requirements is kept and marked; otherwise the setup window runs again.
+
+The bundle ships only what the backend runs: the `core/` modules, `core/postprocess_config.json`, `scripts/setup_core.sh` and `requirements.txt` (an allowlist in `build_app.sh`). Python writes its bytecode cache to `~/Library/Application Support/VivoType/pycache`, never into the signed app. Set `VIVOTYPE_SIGN_ID` to a code-signing identity to keep permissions across rebuilds; without it the build is ad-hoc signed, and a signing failure fails the build.
 
 ## Source Layout
 
@@ -23,6 +27,9 @@ There is **no Xcode project** — `build_app.sh` compiles every `.swift` file un
 | `Support.swift` | process/IO helpers, `VivoTypeState`, bundle/App-Support path resolvers |
 | `Dictation.swift` | mic capture + native 16 kHz resample, text injection, correction learning |
 | `Daemon.swift` | persistent Python daemon client (NDJSON over stdin/stdout) |
+| `FieldWatch.swift` | watches the just-dictated span in its text field (Accessibility, capped, timed out) |
+| `CorrectionOffers.swift` | the ✓ / Undo correction offer: pairs, tick, undo, expiry into Review |
+| `UI/CorrectionOfferPanel.swift` | the clickable, never-focused offer chip |
 | `Settings.swift` | `config.json` model shared with the backend |
 | `UI/ActivationCoordinator.swift` | ref-counted `.regular`↔`.accessory` policy manager for setup windows |
 | `UI/BrandMark.swift` | accent-tinted rounded-square waveform logo used in first-run windows |
@@ -60,12 +67,32 @@ When you fix VivoType's output, **copy the whole corrected text** (`Cmd+A`, `Cmd
 
 Review them anytime via the menu-bar icon → **Review corrections…**, which gives a Promote / Skip / Discard list (the same logic as `python core/promote.py`, which stays as a CLI fallback).
 
+### Suggest corrections after edits (off by default)
+
+Turn on **Settings → Suggest corrections after edits** and you can fix a word right where it landed, no copying needed:
+
+1. Dictate. VivoType remembers where the text went in the focused text field.
+2. Fix a word in place (for example "Kalpith" → "Kalpit") and pause for about a second.
+3. A chip appears for 15 seconds: **Kalpith → Kalpit  ✓ Learn**.
+   - **✓ Learn** makes it an active rule right away. The chip then offers **Undo** for 15 seconds, which removes exactly that rule.
+   - **Ignore it**, and the fix is filed in **Review corrections…** like a clipboard capture. Nothing is applied.
+   - **Keep editing**, and the chip hides until you pause again.
+   - A new dictation or "scratch that" closes the chip without filing anything.
+   - A ⚠ before a word means it is a common English word. Learning it changes that word everywhere you dictate.
+
+Limits, by design:
+- VivoType only reads plain text fields and text areas through Accessibility. It never reads password fields, or anything while secure input is on.
+- It skips fields over 20,000 characters, and any field it can't read, such as canvas-based editors. For those, the clipboard method above still works.
+- A dictation is learned from once. When the field watch picks it up, the clipboard method ignores it.
+- More than three changed spots in one edit is treated as a rewrite. No chip is shown and the pairs just go to Review.
+
 ## Settings
 
 Open **Settings…** from the menu-bar icon (or **⌘,**) to change:
 - **Push-to-talk key** (default Right Option)
 - **Model** — `small.en` ↔ `tiny.en` (changing the model reloads the daemon; the icon shows a loading state briefly)
 - **Pop sound** and **capture toast** on/off
+- **Suggest corrections after edits** (off by default, see above)
 
 Settings are saved to `~/Library/Application Support/VivoType/config.json` and read by the Python backend too, so the model choice stays consistent across the app and the daemon.
 
@@ -77,10 +104,12 @@ If the daemon crashes, VivoType falls back silently to the one-shot CLI path (sl
 
 ## Configuration
 
-By default the app resolves everything automatically: immutable Python code from the app bundle (`Contents/Resources/`), and all writable state from `~/Library/Application Support/VivoType/`. These environment variables override that (mainly for development):
+By default the app resolves everything automatically: immutable Python code from the app bundle (`Contents/Resources/`), and all writable state from `~/Library/Application Support/VivoType/`. These environment variables override that when launching the app (mainly for development):
 
-- `VIVOTYPE_APP_SUPPORT` — writable home for `.venv`, `models`, `data`, `logs`, `config.json` (default: `~/Library/Application Support/VivoType`)
 - `VIVOTYPE_PYTHON` — path to the Python interpreter (default: `<app-support>/.venv/bin/python`)
 - `VIVOTYPE_CLI` — path to the CLI (default: `<bundle>/Contents/Resources/core/cli.py`)
+- `VIVOTYPE_CONFIG` — path to `config.json` (default: `<app-support>/config.json`)
+
+`VIVOTYPE_APP_SUPPORT` is **not** an app override: the app always uses `~/Library/Application Support/VivoType` and sets `VIVOTYPE_APP_SUPPORT` to that for its Python children. It is honoured only when you run the `core/` Python tools yourself (see `core/paths.py`).
 
 The push-to-talk key is currently `Right-Option` (key code 61).

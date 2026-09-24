@@ -39,16 +39,16 @@ try:
     from core.postprocess import load_config, postprocess
     from core.commands import apply_transform, detect_command
     from core.config import load_settings
-    from core.audioio import has_speech, load_wav
+    from core.audioio import EmptyAudioError, has_speech, load_wav
     from core import asr
-    from core.asr import is_prompt_echo, speech_segments
+    from core.asr import compose_initial_prompt, is_prompt_echo, speech_segments
 except ImportError:
     from postprocess import load_config, postprocess
     from commands import apply_transform, detect_command
     from config import load_settings
-    from audioio import has_speech, load_wav
+    from audioio import EmptyAudioError, has_speech, load_wav
     import asr
-    from asr import is_prompt_echo, speech_segments
+    from asr import compose_initial_prompt, is_prompt_echo, speech_segments
 
 
 def _eprint(message: str) -> None:
@@ -105,6 +105,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Disable Indic post-processing (filler removal, dictionary, currency).",
     )
     parser.add_argument(
+        "--voice-commands",
+        action="store_true",
+        help="Act on spoken commands (\"scratch that\", \"new line\", ...). "
+             "Off by default: every phrase is typed as words. Mirrors the "
+             "daemon's 'voice_commands' request field.",
+    )
+    parser.add_argument(
         "--profile",
         default="default",
         help="Post-processing profile name from postprocess_config.json "
@@ -129,6 +136,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         audio = load_audio(audio_path)
+    except EmptyAudioError:
+        # A zero-frame recording is silence, not a failure (mirrors the daemon).
+        print("")
+        return 0
     except Exception as exc:  # surface a clean message to stderr, never stdout
         _eprint(f"Error: could not read audio '{audio_path}': {exc}")
         return 1
@@ -141,8 +152,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     model_name = args.model or load_settings().get("model", "small.en")
+    prompt = compose_initial_prompt(args.initial_prompt)
     try:
-        segments = transcribe(audio, model_name, initial_prompt=args.initial_prompt)
+        segments = transcribe(audio, model_name, initial_prompt=prompt)
     except Exception as exc:
         _eprint(f"Error: transcription failed: {exc}")
         return 1
@@ -177,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 _eprint(f"Warning: post-processing config failed ({exc}); returning raw ASR text")
         signal, remaining, transform = None, text, "none"
-        if pp_config is not None:
+        if pp_config is not None and args.voice_commands:
             try:
                 signal, remaining, transform = detect_command(
                     remaining, leading_fillers=pp_config.get("fillers"))
@@ -204,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
                     _eprint(f"Warning: command transform failed ({exc}); returning cleaned text")
         # Echo guard after cleanup so filler-prefixed echoes still drop
         # (same order the daemon reliability path aims for).
-        if is_prompt_echo(text, args.initial_prompt):
+        if is_prompt_echo(text, prompt):
             text = ""
         print(text)
 

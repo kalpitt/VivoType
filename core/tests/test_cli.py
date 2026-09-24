@@ -83,6 +83,30 @@ class CliErrorTests(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
         self.assertIn("could not read audio", err.getvalue())
 
+    def test_empty_wav_prints_nothing_and_exits_0(self):
+        # A-F4: a zero-frame recording is silence, not an error; exit 1 would
+        # surface as a failed dictation in the app's CLI fallback.
+        called = []
+        orig = cli.transcribe
+        cli.transcribe = lambda *a, **k: called.append(1) or []
+        try:
+            for raw in ([], ["--raw"]):
+                with tempfile.TemporaryDirectory() as d:
+                    p = Path(d) / "empty.wav"
+                    with wave.open(str(p), "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(16000)
+                    out, err = io.StringIO(), io.StringIO()
+                    with redirect_stdout(out), redirect_stderr(err):
+                        rc = cli.main([str(p)] + raw)
+                self.assertEqual(rc, 0)
+                self.assertEqual(out.getvalue().strip(), "")
+                self.assertEqual(err.getvalue(), "")
+        finally:
+            cli.transcribe = orig
+        self.assertEqual(called, [])
+
 
 class CliOutputTests(unittest.TestCase):
     def setUp(self):
@@ -151,6 +175,26 @@ class CliOutputTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out.strip(), "")
 
+    def test_primer_only_echo_is_dropped(self):
+        cli.transcribe = lambda audio, model, initial_prompt="": [
+            _FakeSeg(0.0, 1.0, " Hello, welcome to my lecture.", -0.1)
+        ]
+        rc, out = self._run([self.path, "--initial-prompt", "VivoType, menu"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "")
+
+    def test_composed_prompt_passed_to_transcribe(self):
+        captured = []
+
+        def fake_tx(audio, model, initial_prompt=""):
+            captured.append(initial_prompt)
+            return [_FakeSeg(0.0, 1.0, " hello", -0.1)]
+
+        cli.transcribe = fake_tx
+        rc, out = self._run([self.path, "--initial-prompt", "VivoType, menu"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured, ["Hello, welcome to my lecture. VivoType, menu"])
+
     def test_postprocess_failure_returns_raw(self):
         from unittest import mock
         cli.transcribe = lambda audio, model, initial_prompt="": [
@@ -200,10 +244,18 @@ class CliOutputTests(unittest.TestCase):
         ]
         err = io.StringIO()
         with redirect_stderr(err):
-            rc, out = self._run([self.path])
+            rc, out = self._run([self.path, "--voice-commands"])
         self.assertEqual(rc, 0)
         self.assertEqual(out.strip(), "")
         self.assertIn("cannot delete", err.getvalue())
+
+    def test_commands_off_by_default_types_words(self):
+        cli.transcribe = lambda audio, model, initial_prompt="": [
+            _FakeSeg(0.0, 1.0, " scratch that", -0.3)
+        ]
+        rc, out = self._run([self.path])
+        self.assertEqual(rc, 0)
+        self.assertIn("scratch that", out.lower())
 
     def test_fallback_transform_applied_like_daemon(self):
         cfg = self._write_profile_config()

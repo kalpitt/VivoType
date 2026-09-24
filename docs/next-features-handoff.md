@@ -1,10 +1,11 @@
 # VivoType — Handoff: "Next" Features (Trust Surface, Per-App Profiles, Voice Commands)
 
 > **STATUS 2026-08-23: ALL THREE FEATURES SHIPPED.** Feature 2 merged (#29),
-> Feature 3 merged (#34), Feature 4 open as PR #36. The sketches below are
+> Feature 3 merged (#34), Feature 4 merged (#36). The sketches below are
 > kept as historical spec; where the code deliberately deviates, an "As
 > built" note at the top of each feature section is authoritative — read the
-> code and tests as final truth. Candidate for archiving once #36 merges.
+> code and tests as final truth. Kept per your call (1a) — archive when you
+> say so.
 
 *Written 2026-07-18 for a fresh session (any model tier) to implement without
 further architectural judgment calls. Cross-references

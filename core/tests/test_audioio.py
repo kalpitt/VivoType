@@ -135,6 +135,56 @@ class LoadWavTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_wav(p)
 
+    def test_empty_wav_raises_empty_audio_error(self):
+        # A-F4: callers treat a zero-frame clip as silence, not as an error,
+        # so the empty case gets its own ValueError subclass.
+        from core.audioio import EmptyAudioError
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "empty.wav"
+            _write_raw_wav(p, np.zeros(0, dtype=np.float32), TARGET_SR)
+            with self.assertRaises(EmptyAudioError):
+                load_wav(p)
+
+    def _truncate(self, path: Path, nbytes: int) -> None:
+        # Chop bytes off the data chunk: the header still claims the full
+        # frame count, exactly like a recording cut off mid-write.
+        with open(path, "r+b") as fh:
+            fh.seek(0, 2)
+            fh.truncate(fh.tell() - nbytes)
+
+    def test_partial_last_frame_is_trimmed_mono(self):
+        # A-F12: an odd byte count in a 16-bit file used to raise "buffer size
+        # must be a multiple of element size" and lose the whole dictation.
+        tone = (0.1 * np.sin(np.arange(1600) * 0.1)).astype(np.float32)
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "trunc.wav"
+            _write_raw_wav(p, tone, TARGET_SR)
+            self._truncate(p, 1)
+            out = load_wav(p)
+        self.assertEqual(len(out), 1599)
+        np.testing.assert_allclose(out, tone[:1599], atol=1e-3)
+
+    def test_partial_last_frame_is_trimmed_stereo(self):
+        # 16-bit stereo cut mid-frame: 3 stray bytes must be dropped, not
+        # crash the (-1, 2) reshape.
+        tone = (0.1 * np.sin(np.arange(1600) * 0.1)).astype(np.float32)
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "trunc_st.wav"
+            _write_raw_wav(p, tone, TARGET_SR, nchannels=2)
+            self._truncate(p, 1)
+            out = load_wav(p)
+        self.assertEqual(len(out), 1599)
+        np.testing.assert_allclose(out, tone[:1599], atol=1e-3)
+
+    def test_only_a_partial_frame_counts_as_empty(self):
+        from core.audioio import EmptyAudioError
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "one_byte.wav"
+            _write_raw_wav(p, np.zeros(1, dtype=np.float32), TARGET_SR)
+            self._truncate(p, 1)
+            with self.assertRaises(EmptyAudioError):
+                load_wav(p)
+
     def test_contiguous_float32_output(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "c.wav"

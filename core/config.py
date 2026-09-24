@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -45,6 +46,9 @@ DEFAULTS = {
     "sound_enabled": True,
     "toast_enabled": True,
     "hud_enabled": True,         # False = sound-only, no on-screen recording pill
+    "suggest_corrections": False,  # ✓/Undo offer after an in-place edit (Mac)
+    "recording_sounds": False,   # start/stop cues, independent of the pill
+    "voice_commands": False,     # True = act on "scratch that", "new line", ...
     "app_profiles": {},          # frontmost bundle ID -> postprocess profile name
 }
 
@@ -59,8 +63,12 @@ def load_settings(path=None):
                 data = json.load(fh)
             if isinstance(data, dict):
                 settings.update(data)
-        except (json.JSONDecodeError, OSError):
-            pass  # keep defaults on a corrupt/unreadable file
+        except (ValueError, OSError, RecursionError) as exc:
+            # Corrupt JSON, non-UTF-8 bytes (UnicodeDecodeError is a
+            # ValueError) or pathological nesting: keep defaults so the daemon
+            # and CLI still start, but say why.
+            print(f"VivoType: ignoring unreadable config '{path}' "
+                  f"({type(exc).__name__}); using defaults.", file=sys.stderr)
     # Soft type checks: a hand-edited "model": 123 must not become
     # whisper-123-mlx via asr.repo_for — fall back to the typed default.
     if not isinstance(settings.get("model"), str) or not settings["model"]:
@@ -69,7 +77,8 @@ def load_settings(path=None):
         settings["hotkey_keycode"] = DEFAULTS["hotkey_keycode"]
     if not isinstance(settings.get("hotkey_label"), str):
         settings["hotkey_label"] = DEFAULTS["hotkey_label"]
-    for flag in ("sound_enabled", "toast_enabled", "hud_enabled"):
+    for flag in ("sound_enabled", "toast_enabled", "hud_enabled", "recording_sounds", "voice_commands",
+                 "suggest_corrections"):
         if not isinstance(settings.get(flag), bool):
             settings[flag] = DEFAULTS[flag]
     # app_profiles must be a {bundle ID -> profile name} dict; a hand-edited

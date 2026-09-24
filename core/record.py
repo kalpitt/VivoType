@@ -146,8 +146,15 @@ def main(argv: list[str] | None = None) -> int:
     path = outdir / f"{_slugify(label)}-{stamp}.wav"
     labels_csv = _labels_csv()
 
+    # The saved file is always mono (the format the ASR CLI expects): average
+    # a multi-channel capture's frames instead of writing interleaved samples
+    # under a mono header, which played back at double length.
+    samples = audio.astype("float32") / 32768.0
+    if samples.ndim == 2:
+        samples = samples.mean(axis=1)
+
     try:
-        write_wav(path, audio.astype("float32") / 32768.0, args.samplerate)
+        write_wav(path, samples, args.samplerate)
     except Exception as exc:
         _eprint(f"Error: could not write '{path}': {exc}")
         return 1
@@ -156,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
         "filename": _manifest_filename(path, labels_csv),
         "label": label,
         "samplerate": args.samplerate,
-        "channels": args.channels,
+        "channels": CHANNELS,  # the saved file, always mono
         "duration_sec": round(seconds, 3),
         "recorded_at": stamp,
     }, labels_csv)

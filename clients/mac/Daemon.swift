@@ -124,6 +124,9 @@ final class DaemonClient {
         }
         process = proc
         inHandle = inPipe.fileHandleForWriting
+        // Writing to a daemon that just died must fail with EPIPE (caught in
+        // sendJSON), not raise SIGPIPE, whose default action kills the app.
+        _ = fcntl(inPipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
 
         // Drain stderr into a log file so Python tracebacks survive a crash —
         // "daemon terminated" with no diagnostics is undebuggable in the field.
@@ -158,11 +161,25 @@ final class DaemonClient {
         }
     }
 
+    /// Callers typically drop their only reference right after calling this
+    /// (restartBackend, onboarding retry), so the block captures self
+    /// STRONGLY: with a weak capture it ran after deallocation and did
+    /// nothing — no shutdown message, no kill, an orphaned daemon, and
+    /// in-flight completions that never fired (Dictation stuck busy).
     func shutdown() {
-        daemonQueue.async { [weak self] in
-            guard let self = self, !self.didShutdown else { return }
+        daemonQueue.async { [self] in
+            guard !self.didShutdown else { return }
             self.didShutdown = true
+            // Fail in-flight requests over now: after shutdown nothing will
+            // ever answer them, and the EOF handler may never run (it holds
+            // only a weak reference).
+            let callbacks = self.pendingCallbacks
+            self.pendingCallbacks.removeAll()
+            DispatchQueue.main.async { for c in callbacks.values { c(nil) } }
             self.sendJSON(["cmd": "shutdown"])
+            // A dying daemon takes no new work during the grace window.
+            self.isReady = false
+            self.inHandle = nil
             // Grace for a clean JSON shutdown, then the same SIGTERM→SIGKILL
             // backstop hang recovery uses — a wedged MLX call ignores SIGTERM.
             let oldProc = self.process
@@ -209,7 +226,9 @@ final class DaemonClient {
     /// Returns nil immediately if the daemon is not yet ready (caller falls back to CLI).
     /// `profile` selects per-app post-processing rules (core/postprocess_config.json
     /// "profiles"); unknown names degrade to default rules daemon-side.
+    /// `voiceCommands` false (the default) types every phrase as words.
     func transcribe(wav: URL, initialPrompt: String, profile: String = "default",
+                    voiceCommands: Bool = false,
                     completion: @escaping (String?) -> Void) {
         daemonQueue.async { [weak self] in
             guard let self = self, self.isReady else {
@@ -220,7 +239,7 @@ final class DaemonClient {
             self.pendingCallbacks[id] = completion
             self.sendJSON(["id": id, "wav": wav.path,
                            "initial_prompt": initialPrompt, "raw": false,
-                           "profile": profile])
+                           "profile": profile, "voice_commands": voiceCommands])
             // Watchdog: if the daemon hasn't answered by then, fail this request
             // over to the CLI. A reply arriving later finds no pending callback
             // and is dropped harmlessly (handleMessage's removeValue).
@@ -387,6 +406,8 @@ final class DaemonClient {
             respawnFreshDaemon(statusCallback: cb)
             return
         }
+        // A requested shutdown ending in EOF is expected, not an error.
+        guard !didShutdown else { return }
         DispatchQueue.main.async { cb?(.error("daemon terminated")) }
     }
 

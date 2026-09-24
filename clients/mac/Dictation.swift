@@ -114,6 +114,15 @@ final class Dictation {
 
         let input = engine.inputNode
         let hwFormat = input.outputFormat(forBus: 0)
+        // No usable input device (none attached, or a USB mic just unplugged):
+        // the format is 0 Hz / 0 channels and installTap would raise an
+        // Objective-C exception Swift cannot catch — the app would crash.
+        guard hwFormat.sampleRate > 0, hwFormat.channelCount > 0 else {
+            warn("VivoType: no usable microphone (input format \(hwFormat)).")
+            onCaptureLost?("No microphone found — check your input device")
+            onState?(.error)
+            return
+        }
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("vivotype-\(UUID().uuidString).wav")
 
@@ -209,9 +218,16 @@ final class Dictation {
         engine.stop()
         isRecording = false
         audioConverter = nil
+        let framesWritten = audioFile?.length ?? 0
         audioFile = nil  // closes the file
         guard let url = tempURL else { return }
         tempURL = nil
+        guard framesWritten > 0 else {
+            try? FileManager.default.removeItem(at: url)
+            warn("VivoType: empty recording (no audio frames) — nothing to transcribe.")
+            onState?(.idle)
+            return
+        }
         isBusy = true
         onState?(.transcribing)
 
@@ -416,7 +432,7 @@ final class Dictation {
             warn("VivoType: CLI exited \(result.status): \(detail)")
             return nil
         }
-        return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cliTranscript(result.stdout)
     }
 
     // MARK: text injection
@@ -425,20 +441,9 @@ final class Dictation {
         lastInjected = text
         lastInjectedAt = Date()
 
-        // Typing and synthetic ⌘V both need Accessibility. Without it, park the
-        // transcript as a normal pasteboard string so the user can ⌘V themselves —
-        // no fragile workarounds. Toast (via onInjectBlocked) is the only UX;
-        // do not set .error (finish() would immediately overwrite it with .idle).
-        guard AXIsProcessTrusted() else {
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(text, forType: .string)
-            lastSeenChangeCount = pasteboard.changeCount  // our write, not a correction
-            warn("VivoType: Accessibility missing — text copied to the clipboard.")
-            onInjectBlocked?("Accessibility needed — text copied, press ⌘V to paste")
-            return
-        }
-
+        // Checked FIRST, before Accessibility: a secure field must get the
+        // concealed, self-clearing parking below even when Accessibility is
+        // off, and must never stay behind as `lastInjected` text.
         // A password field (or any app holding secure event input) swallows
         // synthetic keystrokes AND ⌘V silently — the text would just vanish.
         // Park it on the clipboard instead so nothing is lost, and say so.
@@ -468,6 +473,20 @@ final class Dictation {
             return
         }
 
+        // Typing and synthetic ⌘V both need Accessibility. Without it, park the
+        // transcript as a normal pasteboard string so the user can ⌘V themselves —
+        // no fragile workarounds. Toast (via onInjectBlocked) is the only UX;
+        // do not set .error (finish() would immediately overwrite it with .idle).
+        guard AXIsProcessTrusted() else {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+            lastSeenChangeCount = pasteboard.changeCount  // our write, not a correction
+            warn("VivoType: Accessibility missing — text copied to the clipboard.")
+            onInjectBlocked?("Accessibility needed — text copied, press ⌘V to paste")
+            return
+        }
+
         let frontBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         if Dictation.browserBundleIDs.contains(frontBundle ?? "") {
             pasteViaClipboard(text)
@@ -491,11 +510,23 @@ final class Dictation {
     @discardableResult
     private func typeUnicode(_ text: String) -> Bool {
         let source = CGEventSource(stateID: .combinedSessionState)
-        let scalars = Array(text.utf16)
         let chunkSize = 16  // a single long unicode event is dropped/garbled by some apps
-        var index = 0
-        while index < scalars.count {
-            let chunk = Array(scalars[index..<min(index + chunkSize, scalars.count)])
+        // Chunks end on Character (grapheme) boundaries: a fixed 16-unit cut
+        // split emoji surrogate pairs and combining sequences across two
+        // events, which apps render as garbage. One Character longer than the
+        // limit (rare ZWJ emoji) is sent alone rather than split.
+        var chunks: [[UInt16]] = []
+        var current: [UInt16] = []
+        for character in text {
+            let units = Array(String(character).utf16)
+            if !current.isEmpty && current.count + units.count > chunkSize {
+                chunks.append(current)
+                current = []
+            }
+            current.append(contentsOf: units)
+        }
+        if !current.isEmpty { chunks.append(current) }
+        for chunk in chunks {
             guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
                   let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
             else { return false }
@@ -505,15 +536,20 @@ final class Dictation {
             }
             down.post(tap: .cghidEventTap)
             up.post(tap: .cghidEventTap)
-            index += chunkSize
         }
         return true
     }
 
     private func pasteViaClipboard(_ text: String) {
         let pasteboard = NSPasteboard.general
-        let previous = pasteboard.string(forType: .string)  // to restore afterward
+        // Snapshot every item and type (images, files, rich text) so they come
+        // back after the paste; falls back to the plain string when a faithful
+        // copy isn't possible (see snapshotPasteboard).
+        let previousItems = snapshotPasteboard(pasteboard)
+        let previousString = previousItems == nil ? pasteboard.string(forType: .string) : nil
         pasteboard.clearContents()
+        // Transient marker: well-behaved clipboard managers skip this write.
+        pasteboard.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
         pasteboard.setString(text, forType: .string)
         // Our own clipboard write — don't mistake it for a user correction.
         lastSeenChangeCount = pasteboard.changeCount
@@ -530,14 +566,46 @@ final class Dictation {
         up.post(tap: .cghidEventTap)
 
         // Restore the user's previous clipboard once the paste has landed.
-        guard let previous = previous else { return }
+        // (Known residual, unchanged: a target slower than 0.4 s to read the
+        // paste would get the restored clipboard instead.)
+        if previousItems?.isEmpty ?? (previousString == nil) { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             let pb = NSPasteboard.general
             guard pb.changeCount == targetCount else { return }  // user copied something new; don't clobber it
             pb.clearContents()
-            pb.setString(previous, forType: .string)
+            if let items = previousItems {
+                pb.writeObjects(items)
+            } else if let string = previousString {
+                pb.setString(string, forType: .string)
+            }
             self?.lastSeenChangeCount = pb.changeCount  // our restore — ignore it too
         }
+    }
+
+    /// Past this total size the snapshot is skipped: every representation is
+    /// read synchronously on the main thread, and a huge multi-format image
+    /// would stall injection.
+    private static let clipboardSnapshotLimit = 16 * 1_048_576
+
+    /// A faithful copy of every clipboard item and type, or nil when one can't
+    /// be made cheaply: a representation that won't materialise (a lazy
+    /// provider that fails, a file promise) or too much data. The caller then
+    /// keeps only the plain string, as before — never a half-restored clipboard.
+    private func snapshotPasteboard(_ pasteboard: NSPasteboard) -> [NSPasteboardItem]? {
+        var copies: [NSPasteboardItem] = []
+        var total = 0
+        for item in pasteboard.pasteboardItems ?? [] {
+            let copy = NSPasteboardItem()
+            for type in item.types {
+                if type.rawValue.lowercased().contains("promise") { return nil }
+                guard let data = item.data(forType: type) else { return nil }
+                total += data.count
+                if total > Self.clipboardSnapshotLimit { return nil }
+                copy.setData(data, forType: type)
+            }
+            copies.append(copy)
+        }
+        return copies
     }
 
     // MARK: correction learning
@@ -575,6 +643,17 @@ final class Dictation {
         }
     }
 
+    /// The correction offer found this dictation in its text field and now
+    /// owns learning from it: forget it here so the clipboard path can't log
+    /// the same utterance too. False when the clipboard path already claimed
+    /// it, or a newer dictation replaced it.
+    func claimLastInjection(_ text: String) -> Bool {
+        guard lastInjected == text else { return false }
+        lastInjected = nil
+        lastInjectedAt = Date(timeIntervalSince1970: 0)
+        return true
+    }
+
     // Word-overlap (Jaccard) similarity — Python does the precise diff.
     private func similarity(_ a: String, _ b: String) -> Double {
         let wa = Set(a.lowercased().split { !$0.isLetter && !$0.isNumber })
@@ -584,8 +663,9 @@ final class Dictation {
     }
 
     private func runLearn(original: String, corrected: String) -> Int {
-        let result = runProcess(pythonPath, [learnPath, "--original", original, "--corrected", corrected],
-                                timeout: 60)
+        guard let payload = try? JSONSerialization.data(
+            withJSONObject: ["original": original, "corrected": corrected]) else { return 0 }
+        let result = runProcess(pythonPath, [learnPath], timeout: 60, input: payload)
         return Int(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
     }
 }

@@ -138,18 +138,60 @@ class PreProtocolCrashTests(unittest.TestCase):
         self.assertEqual(msgs[0]["status"], "error")
         self.assertIn("bad json", msgs[0]["error"])
 
-    def test_postprocess_config_load_raise_emits_error_and_exits(self):
-        out_buf = io.StringIO()
-        with mock.patch("core.daemon.load_config", side_effect=ValueError("bad pp config")), \
-             mock.patch("sys.stdin", io.StringIO("")), \
-             mock.patch("sys.stdout", out_buf), \
-             self.assertRaises(SystemExit):
-            daemon.main()
+    def test_postprocess_config_load_raise_falls_back_and_serves(self):
+        # A-F3: a raising post-processing config (e.g. a wrong-typed user
+        # dictionary) must not stop dictation at boot — the daemon falls back
+        # to the built-in rules, warns on stderr, and still reports ready.
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            wav = Path(d) / "t.wav"
+            _make_wav(wav)
+            model_mock = mock.Mock()
+            model_mock.transcribe.return_value = ([_FakeSeg(" blr")], None)
+            with mock.patch("core.daemon.load_config",
+                            side_effect=TypeError("'int' object is not iterable")), \
+                 mock.patch("core.daemon._load_model", return_value=model_mock), \
+                 mock.patch("core.daemon._is_model_cached", return_value=True), \
+                 mock.patch("sys.stdin", io.StringIO(
+                     json.dumps({"id": 1, "wav": str(wav)}) + "\n")), \
+                 mock.patch("sys.stdout", io.StringIO()) as out_buf, \
+                 contextlib.redirect_stderr(err):
+                daemon.main()
 
         msgs = [json.loads(l) for l in out_buf.getvalue().splitlines() if l.strip()]
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0]["status"], "error")
-        self.assertIn("bad pp config", msgs[0]["error"])
+        self.assertIn("ready", [m.get("status") for m in msgs])
+        self.assertNotIn("error", [m.get("status") for m in msgs])
+        reply = next(m for m in msgs if m.get("id") == 1)
+        self.assertEqual(reply["text"], "Bengaluru")  # built-in default rule
+        self.assertIn("int", err.getvalue())
+
+    def test_wrong_typed_user_dictionary_at_boot_uses_shipped_rules(self):
+        # A-F3 end-to-end through the REAL loader: {"fillers": 5} in the user
+        # overlay made the daemon exit at every (re)spawn. The shipped base
+        # config must still apply.
+        model_mock = mock.Mock()
+        model_mock.transcribe.return_value = ([_FakeSeg(" um shipped word")], None)
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / "pp.json"
+            base.write_text(json.dumps(
+                {"fillers": ["um"], "replacements": {"shipped": "Shipped!"}}),
+                encoding="utf-8")
+            overlay = Path(d) / "user_dictionary.json"
+            overlay.write_text(json.dumps({"fillers": 5}), encoding="utf-8")
+            wav = Path(d) / "t.wav"
+            _make_wav(wav)
+            with mock.patch("core.postprocess.DEFAULT_CONFIG_PATH", base), \
+                 mock.patch("core.postprocess.USER_DICT_PATH", overlay), \
+                 mock.patch("core.daemon._load_model", return_value=model_mock), \
+                 mock.patch("core.daemon._is_model_cached", return_value=True), \
+                 mock.patch("sys.stdin", io.StringIO(
+                     json.dumps({"id": 1, "wav": str(wav)}) + "\n")), \
+                 mock.patch("sys.stdout", io.StringIO()) as out_buf, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                daemon.main()
+        msgs = [json.loads(l) for l in out_buf.getvalue().splitlines() if l.strip()]
+        reply = next(m for m in msgs if m.get("id") == 1)
+        self.assertEqual(reply["text"], "Shipped! word")
 
     def test_no_model_load_attempted_after_startup_crash(self):
         # A startup crash must exit before ever touching the (possibly slow /
@@ -211,9 +253,9 @@ class TranscriptionTests(unittest.TestCase):
                 {"cmd": "shutdown"},
             ], model_mock=model_mock)
         _, kwargs = model_mock.transcribe.call_args
-        self.assertEqual(kwargs.get("initial_prompt"), "Kalpit,Bengaluru")
+        self.assertEqual(kwargs.get("initial_prompt"), "Hello, welcome to my lecture. Kalpit,Bengaluru")
 
-    def test_empty_initial_prompt_not_passed(self):
+    def test_empty_initial_prompt_passes_primer(self):
         model_mock = mock.Mock()
         model_mock.transcribe.return_value = ([_FakeSeg(" hi")], None)
         with tempfile.TemporaryDirectory() as d:
@@ -224,7 +266,7 @@ class TranscriptionTests(unittest.TestCase):
                 {"cmd": "shutdown"},
             ], model_mock=model_mock)
         _, kwargs = model_mock.transcribe.call_args
-        self.assertNotIn("initial_prompt", kwargs)
+        self.assertEqual(kwargs.get("initial_prompt"), "Hello, welcome to my lecture.")
 
     def test_raw_mode_returns_json_segment_lines(self):
         model_mock = mock.Mock()
@@ -495,6 +537,29 @@ class TranscribeUnitTests(unittest.TestCase):
             result = daemon._transcribe(model, wav, "VivoType, menu", False, self._pp())
         self.assertEqual(result["text"], "")
 
+    def test_primer_only_echo_is_dropped(self):
+        # Primer prepended in core must be dropped on silence even when the
+        # full prompt was primer + vocabulary.
+        model = mock.Mock()
+        model.transcribe.return_value = (
+            [_FakeSeg(" Hello, welcome to my lecture.", no_speech_prob=0.1)], None)
+        with tempfile.TemporaryDirectory() as d:
+            wav = str(Path(d) / "x.wav")
+            _make_wav(Path(wav))
+            result = daemon._transcribe(model, wav, "VivoType, menu", False, self._pp())
+        self.assertEqual(result["text"], "")
+
+    def test_doubled_primer_echo_is_dropped(self):
+        model = mock.Mock()
+        model.transcribe.return_value = (
+            [_FakeSeg(" Hello, welcome to my lecture. Hello, welcome to my lecture.",
+                      no_speech_prob=0.1)], None)
+        with tempfile.TemporaryDirectory() as d:
+            wav = str(Path(d) / "x.wav")
+            _make_wav(Path(wav))
+            result = daemon._transcribe(model, wav, "VivoType, menu", False, self._pp())
+        self.assertEqual(result["text"], "")
+
     def test_postprocess_failure_returns_raw_asr(self):
         # A broken dictionary rule must not drop the transcript.
         model = mock.Mock()
@@ -584,6 +649,86 @@ class ModelLoadFailureIntegrationTests(unittest.TestCase):
         # ...and the old (real MLXModel) model still transcribes.
         tx = next(m for m in msgs if "id" in m)
         self.assertEqual(tx["text"], "still works")
+
+
+class ReloadEdgeCaseTests(unittest.TestCase):
+    """A-F2 / A-F3 / A-F8 on the reload control path."""
+
+    def _run(self, commands, load_side_effect=None, extra_patches=()):
+        loads = []
+
+        def _fake_load(name):
+            loads.append(name)
+            if load_side_effect:
+                load_side_effect(name)
+            m = mock.Mock()
+            m.transcribe.return_value = ([_FakeSeg(" blr")], None)
+            return m
+
+        stdin = io.StringIO("\n".join(json.dumps(c) for c in commands) + "\n")
+        with contextlib.ExitStack() as stack:
+            for p in extra_patches:
+                stack.enter_context(p)
+            stack.enter_context(mock.patch("core.daemon._load_model", side_effect=_fake_load))
+            stack.enter_context(mock.patch("core.daemon._is_model_cached", return_value=True))
+            stack.enter_context(mock.patch("core.daemon.load_settings",
+                                           return_value={"model": "small.en"}))
+            stack.enter_context(mock.patch("sys.stdin", stdin))
+            out_buf = stack.enter_context(mock.patch("sys.stdout", io.StringIO()))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            daemon.main()
+        msgs = [json.loads(l) for l in out_buf.getvalue().splitlines() if l.strip()]
+        return msgs, loads
+
+    def test_reload_to_current_model_still_emits_ready(self):
+        # A-F2: the client flips isReady false on sending reload and waits
+        # for ready; a same-model reload used to emit nothing at all.
+        msgs, loads = self._run([{"cmd": "reload", "model": "small.en"},
+                                 {"cmd": "shutdown"}])
+        readies = [m for m in msgs if m.get("status") == "ready"]
+        self.assertEqual(len(readies), 2)  # boot + reload
+        self.assertEqual(readies[-1]["model"], "small.en")
+        self.assertEqual(loads, ["small.en"])  # no pointless reload
+
+    def test_reload_without_model_field_emits_ready(self):
+        msgs, loads = self._run([{"cmd": "reload"}, {"cmd": "shutdown"}])
+        self.assertEqual([m.get("status") for m in msgs].count("ready"), 2)
+        self.assertEqual(loads, ["small.en"])
+
+    def test_reload_with_non_string_model_reports_error_then_ready(self):
+        msgs, loads = self._run([{"cmd": "reload", "model": 5},
+                                 {"cmd": "shutdown"}])
+        statuses = [m.get("status") for m in msgs]
+        self.assertIn("error", statuses)
+        self.assertEqual(statuses[-1], "ready")
+        self.assertEqual(msgs[-1]["model"], "small.en")
+        self.assertEqual(loads, ["small.en"])
+
+    def test_config_raise_during_model_reload_keeps_daemon_alive(self):
+        # A-F3: the reload path's load_config had no guard, so a wrong-typed
+        # user dictionary killed the daemon on a model switch.
+        calls = {"n": 0}
+
+        def lc(*a, **k):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise TypeError("'int' object is not iterable")
+            return {"fillers": [], "replacements": {"blr": "Bengaluru"},
+                    "profiles": {}}
+
+        with tempfile.TemporaryDirectory() as d:
+            wav = Path(d) / "t.wav"
+            _make_wav(wav)
+            msgs, loads = self._run(
+                [{"cmd": "reload", "model": "tiny.en"},
+                 {"id": 1, "wav": str(wav)},
+                 {"cmd": "shutdown"}],
+                extra_patches=[mock.patch("core.daemon.load_config", side_effect=lc),
+                               mock.patch("core.daemon.config_mtime", return_value=1.0)])
+        readies = [m for m in msgs if m.get("status") == "ready"]
+        self.assertEqual(readies[-1]["model"], "tiny.en")
+        reply = next(m for m in msgs if m.get("id") == 1)
+        self.assertEqual(reply["text"], "Bengaluru")  # last-good rules kept
 
 
 class ReloadGpuCacheTests(unittest.TestCase):
@@ -834,13 +979,86 @@ class ReloadFailureResilienceTests(unittest.TestCase):
         self.assertIn("config reload failed", err.getvalue())
 
 
+class RequestRobustnessTests(unittest.TestCase):
+    """A-F4 / A-F8: odd requests get a reply for their id; the daemon never
+    dies on one bad request."""
+
+    def _empty_wav(self, d):
+        p = Path(d) / "empty.wav"
+        with wave.open(str(p), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+        return p
+
+    def test_empty_wav_is_silence_not_error(self):
+        # An error reply counts toward the client's hang-restart budget; a
+        # zero-frame clip is just a very short silence.
+        with tempfile.TemporaryDirectory() as d:
+            wav = self._empty_wav(d)
+            model_mock = mock.Mock()
+            msgs = _run_daemon([{"id": 3, "wav": str(wav)},
+                                {"id": 4, "wav": str(wav), "raw": True},
+                                {"cmd": "shutdown"}], model_mock=model_mock)
+        replies = [m for m in msgs if "id" in m]
+        self.assertEqual(replies, [{"id": 3, "text": "", "command": None},
+                                   {"id": 4, "text": "", "command": None}])
+        model_mock.transcribe.assert_not_called()
+
+    def test_non_string_initial_prompt_does_not_kill_daemon(self):
+        with tempfile.TemporaryDirectory() as d:
+            wav = Path(d) / "t.wav"
+            _make_wav(wav)
+            msgs = _run_daemon([{"id": 1, "wav": str(wav), "initial_prompt": 5},
+                                {"id": 2, "wav": str(wav), "initial_prompt": ["x"]},
+                                {"id": 3, "wav": str(wav)},
+                                {"cmd": "shutdown"}])
+        replies = {m["id"]: m for m in msgs if "id" in m}
+        self.assertEqual(sorted(replies), [1, 2, 3])
+        # A junk prompt is ignored (primer only), the dictation still lands.
+        self.assertEqual(replies[1]["text"], "hello world")
+        self.assertEqual(replies[3]["text"], "hello world")
+
+    def test_non_string_wav_gets_error_reply(self):
+        msgs = _run_daemon([{"id": 7, "wav": 123},
+                            {"id": 8, "wav": None},
+                            {"cmd": "shutdown"}])
+        replies = [m for m in msgs if "id" in m]
+        self.assertEqual([r["id"] for r in replies], [7, 8])
+        self.assertTrue(all("error" in r for r in replies))
+
+    def test_unexpected_raise_is_isolated_to_its_request(self):
+        with tempfile.TemporaryDirectory() as d:
+            wav = Path(d) / "t.wav"
+            _make_wav(wav)
+            real = daemon._transcribe
+            calls = {"n": 0}
+
+            def flaky(*a, **k):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise AttributeError("boom")
+                return real(*a, **k)
+
+            err = io.StringIO()
+            with mock.patch("core.daemon._transcribe", side_effect=flaky), \
+                 contextlib.redirect_stderr(err):
+                msgs = _run_daemon([{"id": 1, "wav": str(wav)},
+                                    {"id": 2, "wav": str(wav)},
+                                    {"cmd": "shutdown"}])
+        replies = {m["id"]: m for m in msgs if "id" in m}
+        self.assertIn("boom", replies[1]["error"])
+        self.assertNotIn("command", replies[1])  # error replies carry no command
+        self.assertEqual(replies[2]["text"], "hello world")
+
+
 class VoiceCommandTests(unittest.TestCase):
     """Feature 4: literal command phrases. Scratch returns the structural
     signal; transforms apply AFTER postprocess; every normal/silent/raw reply
     carries "command" (null); error replies never do."""
 
     def _msgs(self, segs_text, wav=None, raw=False, load_config_ret=None,
-              postprocess_side_effect=None, initial_prompt=""):
+              postprocess_side_effect=None, initial_prompt="", voice_commands=True):
         model_mock = mock.Mock()
         model_mock.transcribe.return_value = (
             [_FakeSeg(t) for t in segs_text], None)
@@ -852,7 +1070,7 @@ class VoiceCommandTests(unittest.TestCase):
                 wav(path)
             req = json.dumps({"id": 7, "wav": str(path),
                               "initial_prompt": initial_prompt,
-                              "raw": raw})
+                              "raw": raw, "voice_commands": voice_commands})
             out_buf = io.StringIO()
             with contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch(
@@ -874,6 +1092,18 @@ class VoiceCommandTests(unittest.TestCase):
                 daemon.main()
         lines = [l for l in out_buf.getvalue().splitlines() if l.strip()]
         return [json.loads(l) for l in lines]
+
+    def test_commands_off_types_every_phrase_as_words(self):
+        # The default (Settings off, or no field at all): nothing is a command.
+        for enabled in (False, None, "true", 1):
+            msgs = self._msgs([" scratch that"], voice_commands=enabled)
+            reply = next(m for m in msgs if "id" in m)
+            self.assertIsNone(reply["command"], enabled)
+            self.assertIn("scratch that", reply["text"].lower(), enabled)
+        msgs = self._msgs([" first point new line second point"], voice_commands=False)
+        reply = next(m for m in msgs if "id" in m)
+        self.assertIn("new line", reply["text"].lower())
+        self.assertNotIn("\n", reply["text"])
 
     def test_scratch_utterance_signals_structural_command(self):
         msgs = self._msgs([" scratch that"])

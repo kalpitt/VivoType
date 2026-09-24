@@ -30,6 +30,9 @@ final class SettingsController: NSObject, NSWindowDelegate {
     private let soundSwitch = NSSwitch()
     private let toastSwitch = NSSwitch()
     private let hudSwitch = NSSwitch()
+    private let cueSwitch = NSSwitch()
+    private let suggestSwitch = NSSwitch()
+    private let commandsSwitch = NSSwitch()
     private let contactsSwitch = NSSwitch()
 
     /// Live "Idle" / "Downloading model…" readout for the Privacy card, refreshed
@@ -72,6 +75,12 @@ final class SettingsController: NSObject, NSWindowDelegate {
         ("Right Option", 61), ("Left Option", 58),
         ("Right Command", 54), ("Right Control", 62), ("Right Shift", 60),
     ]
+
+    /// Hotkeys in popup order — mirrors `hotkeyPopup`'s items exactly, like
+    /// `modelIds`. Normally just `hotkeyOptions`; a config.json carrying a key we
+    /// don't offer (hand-edited) gets an extra trailing entry so it round-trips
+    /// instead of being rewritten to index 0 on the next unrelated toggle.
+    private var hotkeyChoices: [(label: String, code: UInt16)] = []
 
     init(settings: Settings, configPath: String, onApply: @escaping (Settings) -> Void) {
         self.settings = settings
@@ -133,13 +142,16 @@ final class SettingsController: NSObject, NSWindowDelegate {
         w.delegate = self
 
         // Controls.
-        hotkeyPopup.addItems(withTitles: hotkeyOptions.map { $0.label })
+        rebuildHotkeyPopup()
         hotkeyPopup.target = self; hotkeyPopup.action = #selector(changed)
         rebuildModelPopup()
         modelPopup.target = self; modelPopup.action = #selector(changed)
         soundSwitch.target = self; soundSwitch.action = #selector(changed)
         toastSwitch.target = self; toastSwitch.action = #selector(changed)
         hudSwitch.target = self; hudSwitch.action = #selector(changed)
+        cueSwitch.target = self; cueSwitch.action = #selector(changed)
+        suggestSwitch.target = self; suggestSwitch.action = #selector(changed)
+        commandsSwitch.target = self; commandsSwitch.action = #selector(changed)
 
         networkLabel.font = .systemFont(ofSize: 12)
         networkLabel.textColor = .secondaryLabelColor
@@ -161,17 +173,24 @@ final class SettingsController: NSObject, NSWindowDelegate {
             makeRow(symbol: "command", title: "Push-to-talk key",
                     desc: "Hold this key to dictate", control: hotkeyPopup),
             makeRow(symbol: "waveform", title: "Model",
-                    desc: "Higher accuracy uses more memory", control: modelPopup),
-            makeRow(symbol: "eye.slash", title: "Hide recording HUD",
-                    desc: "Use sounds instead of the on-screen pill", control: hudSwitch),
+                    desc: "Both are fast", control: modelPopup),
+            makeRow(symbol: "record.circle", title: "Show recording indicator",
+                    desc: "A small pill on screen while you dictate", control: hudSwitch),
+            makeRow(symbol: "speaker.wave.2", title: "Start and stop sounds",
+                    desc: "A soft sound when recording starts and ends", control: cueSwitch),
+            makeRow(symbol: "text.bubble", title: "Voice commands",
+                    desc: "Act on “scratch that”, “new line”…",
+                    control: commandsSwitch),
         ])
         let contexts = makeContextsCard()
         rebuildContextRows()
         let notifications = makeCard([
-            makeRow(symbol: "speaker.wave.2.fill", title: "Pop sound",
+            makeRow(symbol: "speaker.wave.2.fill", title: "Correction sound",
                     desc: "Play a sound when a correction is captured", control: soundSwitch),
             makeRow(symbol: "bell.fill", title: "Capture toast",
                     desc: "Show a chip when a correction is learned", control: toastSwitch),
+            makeRow(symbol: "checkmark.circle.fill", title: "Suggest corrections after edits",
+                    desc: "After you fix a dictated word in place, offer ✓ to learn it", control: suggestSwitch),
         ])
         let privacy = makeCard([
             makeRow(symbol: "lock.shield.fill", title: "On-device processing",
@@ -208,21 +227,27 @@ final class SettingsController: NSObject, NSWindowDelegate {
         outer.translatesAutoresizingMaskIntoConstraints = false
 
         contentStack = outer
-        let container = NSView()
+        let container = FlippedView()  // top-anchored inside the scroll view
         container.addSubview(outer)
         NSLayoutConstraint.activate([
             outer.topAnchor.constraint(equalTo: container.topAnchor, constant: 24),
             outer.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 24),
             outer.widthAnchor.constraint(equalToConstant: contentWidth),
         ])
-        w.contentView = container
-
-        // Size the window to fit the assembled content (fixed-width rows make the
-        // fitting height deterministic).
-        let fitting = outer.fittingSize
-        w.setContentSize(NSSize(width: contentWidth + 48, height: fitting.height + 48))
+        // Scrolls when the content is taller than the screen (it was clipped
+        // under the Dock on smaller displays, with no way to reach the bottom).
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.documentView = container
+        w.contentView = scroll
+        documentView = container
         window = w
+        resizeWindowToFit()
     }
+
+    private var documentView: NSView?
 
     // MARK: builders
 
@@ -236,13 +261,10 @@ final class SettingsController: NSObject, NSWindowDelegate {
     }
 
     private func makeCard(_ rows: [NSView]) -> NSView {
-        let card = NSView()
+        let card = AppearanceLayerView(fill: .controlBackgroundColor, border: .separatorColor)
         card.translatesAutoresizingMaskIntoConstraints = false
-        card.wantsLayer = true
         card.layer?.cornerRadius = 10
-        card.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
         card.layer?.borderWidth = 1
-        card.layer?.borderColor = NSColor.separatorColor.cgColor
 
         // Interleave hairline separators between rows.
         var arranged: [NSView] = []
@@ -267,10 +289,8 @@ final class SettingsController: NSObject, NSWindowDelegate {
     }
 
     private func makeHairline() -> NSView {
-        let line = NSView()
+        let line = AppearanceLayerView(fill: .separatorColor)
         line.translatesAutoresizingMaskIntoConstraints = false
-        line.wantsLayer = true
-        line.layer?.backgroundColor = NSColor.separatorColor.cgColor
         NSLayoutConstraint.activate([
             line.widthAnchor.constraint(equalToConstant: contentWidth),
             line.heightAnchor.constraint(equalToConstant: 1),
@@ -279,11 +299,9 @@ final class SettingsController: NSObject, NSWindowDelegate {
     }
 
     private func makeIconChip(_ symbol: String) -> NSView {
-        let chip = NSView()
+        let chip = AppearanceLayerView(fill: NSColor.controlAccentColor.withAlphaComponent(0.12))
         chip.translatesAutoresizingMaskIntoConstraints = false
-        chip.wantsLayer = true
         chip.layer?.cornerRadius = 7
-        chip.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.12).cgColor
 
         let icon = NSImageView()
         icon.translatesAutoresizingMaskIntoConstraints = false
@@ -369,13 +387,10 @@ final class SettingsController: NSObject, NSWindowDelegate {
     /// Card shell for the Contexts rows; the rows themselves live in
     /// `contextsRowsStack` so they can be rebuilt as mappings change.
     private func makeContextsCard() -> NSView {
-        let card = NSView()
+        let card = AppearanceLayerView(fill: .controlBackgroundColor, border: .separatorColor)
         card.translatesAutoresizingMaskIntoConstraints = false
-        card.wantsLayer = true
         card.layer?.cornerRadius = 10
-        card.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
         card.layer?.borderWidth = 1
-        card.layer?.borderColor = NSColor.separatorColor.cgColor
 
         contextsRowsStack.orientation = .vertical
         contextsRowsStack.alignment = .leading
@@ -403,11 +418,9 @@ final class SettingsController: NSObject, NSWindowDelegate {
         for (bundleID, profileName) in settings.appProfiles.sorted(by: { $0.key < $1.key }) {
             rows.append(makeContextRow(bundleID: bundleID, profileName: profileName))
         }
-        let addButton = NSButton(title: "Add…", target: self, action: #selector(addFrontmostApp))
-        addButton.bezelStyle = .rounded
-        rows.append(makeRow(symbol: "plus.app.fill", title: "Add frontmost app",
-                            desc: "Dictate in this app with a chosen context",
-                            control: addButton))
+        rows.append(makeRow(symbol: "plus.app.fill", title: "Add an app",
+                            desc: "Give an open app its own clean-up rules",
+                            control: makeAddAppMenu()))
 
         var arranged: [NSView] = []
         for (i, row) in rows.enumerated() {
@@ -420,10 +433,10 @@ final class SettingsController: NSObject, NSWindowDelegate {
 
     private func makeContextRow(bundleID: String, profileName: String) -> NSView {
         let popup = NSPopUpButton(frame: .zero, pullsDown: false)
-        popup.addItems(withTitles: ["Default rules"])
+        popup.addItems(withTitles: [Self.profileLabel("default")])
         popup.lastItem?.representedObject = "default"
         for name in definedProfileNames?() ?? [] where name != "default" {
-            popup.addItem(withTitle: name)
+            popup.addItem(withTitle: Self.profileLabel(name))
             popup.lastItem?.representedObject = name
         }
         let idx = popup.indexOfItem(withRepresentedObject: profileName)
@@ -494,13 +507,45 @@ final class SettingsController: NSObject, NSWindowDelegate {
         persistContexts()
     }
 
-    @objc private func addFrontmostApp() {
-        // VivoType itself is never a dictation target.
-        guard let app = NSWorkspace.shared.frontmostApplication,
-              app.bundleIdentifier != Bundle.main.bundleIdentifier,
-              let bundleID = app.bundleIdentifier
-        else { return }
-        if settings.appProfiles[bundleID] != nil { return }  // already mapped; edit its popup instead
+    /// Plain-language names for the rule sets in postprocess_config.json.
+    private static func profileLabel(_ name: String) -> String {
+        switch name {
+        case "default": return "Standard clean-up"
+        case "code": return "Code — keep $ and fillers as spoken"
+        default: return name
+        }
+    }
+
+    /// "Add app…" menu of the apps open right now. It used to add the
+    /// frontmost app — but clicking the button makes VivoType frontmost, and
+    /// VivoType is never a dictation target, so it silently did nothing.
+    private func makeAddAppMenu() -> NSPopUpButton {
+        let menu = NSPopUpButton(frame: .zero, pullsDown: true)
+        menu.addItem(withTitle: "Add app…")  // a pull-down's first item is its title
+        let apps = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular }
+            .compactMap { app -> (id: String, name: String)? in
+                guard let id = app.bundleIdentifier, id != Bundle.main.bundleIdentifier,
+                      settings.appProfiles[id] == nil else { return nil }
+                return (id, app.localizedName ?? id)
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        for app in apps {
+            menu.addItem(withTitle: app.name)
+            menu.lastItem?.representedObject = app.id
+            menu.lastItem?.target = self
+            menu.lastItem?.action = #selector(addApp(_:))
+        }
+        if apps.isEmpty {
+            menu.addItem(withTitle: "Open the app first, then add it here")
+            menu.lastItem?.isEnabled = false
+        }
+        return menu
+    }
+
+    @objc private func addApp(_ sender: NSMenuItem) {
+        guard let bundleID = sender.representedObject as? String,
+              settings.appProfiles[bundleID] == nil else { return }
         settings.appProfiles[bundleID] = "default"
         persistContexts()
     }
@@ -508,10 +553,17 @@ final class SettingsController: NSObject, NSWindowDelegate {
     /// The Contexts card changes height as mappings are added/removed — re-fit
     /// the window using the same math as buildWindow so nothing clips or leaves
     /// a growing gap above the footer.
+    /// The window fits its content but never outgrows the screen (menu bar
+    /// and Dock excluded); past that, the content scrolls.
     private func resizeWindowToFit() {
         guard let window = window, let outer = contentStack else { return }
-        let fitting = outer.fittingSize
-        window.setContentSize(NSSize(width: contentWidth + 48, height: fitting.height + 48))
+        let contentHeight = outer.fittingSize.height + 48
+        let width = contentWidth + 48
+        documentView?.frame = NSRect(x: 0, y: 0, width: width, height: contentHeight)
+        let screen = window.screen ?? NSScreen.main
+        let chrome = window.frame.height - window.contentLayoutRect.height  // title bar
+        let maxHeight = (screen?.visibleFrame.height ?? contentHeight) - chrome - 20
+        window.setContentSize(NSSize(width: width, height: min(contentHeight, maxHeight)))
     }
 
     // MARK: state
@@ -529,26 +581,50 @@ final class SettingsController: NSObject, NSWindowDelegate {
         modelPopup.addItems(withTitles: titles)
     }
 
+    /// Fill the hotkey popup from `hotkeyOptions`, plus the stored key if it isn't
+    /// one we offer. Its title carries the key code: NSPopUpButton drops duplicate
+    /// titles, which would desync `hotkeyChoices` from the items.
+    private func rebuildHotkeyPopup() {
+        hotkeyChoices = hotkeyOptions
+        if !hotkeyOptions.contains(where: { $0.code == settings.hotkeyKeycode }) {
+            hotkeyChoices.append((settings.hotkeyLabel, settings.hotkeyKeycode))
+        }
+        hotkeyPopup.removeAllItems()
+        hotkeyPopup.addItems(withTitles: hotkeyChoices.map { choice in
+            hotkeyOptions.contains(where: { $0.code == choice.code })
+                ? choice.label : "\(choice.label) (key \(choice.code))"
+        })
+    }
+
     private func syncControls() {
-        hotkeyPopup.selectItem(at: hotkeyOptions.firstIndex { $0.code == settings.hotkeyKeycode } ?? 0)
+        if !hotkeyChoices.contains(where: { $0.code == settings.hotkeyKeycode }) { rebuildHotkeyPopup() }
+        hotkeyPopup.selectItem(at: hotkeyChoices.firstIndex { $0.code == settings.hotkeyKeycode } ?? 0)
         // Select by model id, not by title — titles are display labels now.
         if !modelIds.contains(settings.model) { rebuildModelPopup() }
         modelPopup.selectItem(at: modelIds.firstIndex(of: settings.model) ?? 0)
         soundSwitch.state = settings.soundEnabled ? .on : .off
         toastSwitch.state = settings.toastEnabled ? .on : .off
-        hudSwitch.state = settings.hudEnabled ? .off : .on   // switch reads "Hide recording HUD"
+        hudSwitch.state = settings.hudEnabled ? .on : .off
+        cueSwitch.state = settings.recordingSounds ? .on : .off
+        suggestSwitch.state = settings.suggestCorrections ? .on : .off
+        commandsSwitch.state = settings.voiceCommands ? .on : .off
         rebuildContextRows()
     }
 
     @objc private func changed() {
-        let option = hotkeyOptions[max(0, hotkeyPopup.indexOfSelectedItem)]
-        settings.hotkeyLabel = option.label
-        settings.hotkeyKeycode = option.code
+        let hotkeyIndex = hotkeyPopup.indexOfSelectedItem
+        if hotkeyChoices.indices.contains(hotkeyIndex) {
+            settings.hotkeyLabel = hotkeyChoices[hotkeyIndex].label
+            settings.hotkeyKeycode = hotkeyChoices[hotkeyIndex].code
+        }
         let modelIndex = modelPopup.indexOfSelectedItem
         if modelIds.indices.contains(modelIndex) { settings.model = modelIds[modelIndex] }
         settings.soundEnabled = (soundSwitch.state == .on)
         settings.toastEnabled = (toastSwitch.state == .on)
-        settings.hudEnabled = (hudSwitch.state == .off)      // on = hide the HUD
+        settings.hudEnabled = (hudSwitch.state == .on)
+        settings.recordingSounds = (cueSwitch.state == .on)
+        settings.suggestCorrections = (suggestSwitch.state == .on)
+        settings.voiceCommands = (commandsSwitch.state == .on)
         settings.save(to: configPath)
         onApply(settings)
     }
@@ -591,12 +667,99 @@ final class SettingsController: NSObject, NSWindowDelegate {
         return bundle
     }
 
+    /// Every reason this bundle can't be restored, as "file: problem" lines; empty
+    /// when every file it carries has the shape its readers expect. A wrong shape
+    /// (`[1,2]`, a number where a replacement string belongs) would otherwise be
+    /// written as-is and break dictation, so a bad file refuses the whole import.
+    /// Mirrors the readers: Settings.load / core/config.py (config.json),
+    /// core/postprocess.py (user_dictionary.json), core/namematch.py and the
+    /// prompt hint (contacts.json). Unknown keys are allowed and kept.
+    func backupProblems(_ bundle: [String: Any]) -> [String] {
+        var problems: [String] = []
+        for (key, _) in backupFiles() {
+            guard let value = bundle[key] else { continue }
+            let name = Self.backupFileNames[key] ?? key
+            guard let obj = value as? [String: Any] else {
+                problems.append("\(name): not a JSON object")
+                continue
+            }
+            for problem in fileProblems(key: key, obj) { problems.append("\(name): \(problem)") }
+        }
+        return problems
+    }
+
+    private static let backupFileNames = [
+        "config": "config.json",
+        "user_dictionary": "user_dictionary.json",
+        "contacts_lexicon": "contacts.json",
+    ]
+
+    private func fileProblems(key: String, _ obj: [String: Any]) -> [String] {
+        var problems: [String] = []
+        func check(_ field: String, _ ok: (Any) -> Bool, _ expected: String) {
+            if let v = obj[field], !ok(v) { problems.append("“\(field)” must be \(expected)") }
+        }
+        switch key {
+        case "config":
+            check("model", { ($0 as? String).map { !$0.isEmpty } ?? false }, "a model name")
+            // Any modifier key (54–63: ⌘ ⇧ ⌥ ⌃ Fn, either side) is accepted,
+            // not just the offered five: Settings keeps a hand-set modifier
+            // such as Fn (63), so its own export must restore.
+            check("hotkey_keycode", { v in
+                guard let code = Self.jsonInt(v) else { return false }
+                return (54...63).contains(code)
+                    || self.hotkeyOptions.contains { Int($0.code) == code }
+            }, "a modifier key code (54–63)")
+            check("hotkey_label", { $0 is String }, "text")
+            for flag in ["sound_enabled", "toast_enabled", "hud_enabled", "recording_sounds", "voice_commands",
+                         "suggest_corrections"] {
+                check(flag, Self.isJSONBool, "true or false")
+            }
+            check("app_profiles", { v in
+                guard let map = v as? [String: Any] else { return false }
+                return map.allSatisfy { !$0.key.isEmpty && $0.value is String }
+            }, "an object of app ID → profile name")
+        case "user_dictionary":
+            check("replacements", { v in
+                (v as? [String: Any])?.values.allSatisfy { $0 is String } ?? false
+            }, "an object of text → text")
+            check("fillers", Self.isStringArray, "a list of words")
+        case "contacts_lexicon":
+            check("names", Self.isStringArray, "a list of names")
+            check("learned", Self.isStringArray, "a list of names")
+        default:
+            break
+        }
+        return problems
+    }
+
+    /// JSON true/false (JSONSerialization gives NSNumber for both bools and
+    /// numbers, and a Swift `as? Bool` would accept 0/1).
+    private static func isJSONBool(_ v: Any) -> Bool {
+        guard let n = v as? NSNumber else { return false }
+        return CFGetTypeID(n) == CFBooleanGetTypeID()
+    }
+
+    /// A JSON integer (not a bool, not a fraction).
+    private static func jsonInt(_ v: Any) -> Int? {
+        guard let n = v as? NSNumber, !isJSONBool(n), !CFNumberIsFloatType(n as CFNumber)
+        else { return nil }
+        return n.intValue
+    }
+
+    private static func isStringArray(_ v: Any) -> Bool {
+        (v as? [Any])?.allSatisfy { $0 is String } ?? false
+    }
+
     /// Write a validated bundle back over the real files. Returns the keys that
     /// failed, empty on full success. Panel-free for the same reason as above.
+    /// Writes nothing at all if any file fails `backupProblems`.
     @discardableResult
     func restore(bundle: [String: Any]) -> [String] {
+        let present = backupFiles().filter { bundle[$0.key] != nil }
+        guard backupProblems(bundle).isEmpty else { return present.map { $0.key } }
         var failed: [String] = []
-        for (key, url) in backupFiles() where bundle[key] != nil {
+        for (key, url) in present {
             guard let obj = bundle[key], JSONSerialization.isValidJSONObject(obj),
                   let out = try? JSONSerialization.data(withJSONObject: obj,
                                                         options: [.prettyPrinted, .sortedKeys])
@@ -665,6 +828,15 @@ final class SettingsController: NSObject, NSWindowDelegate {
             presentError("Nothing to import", "That backup file contains no VivoType data.")
             return
         }
+        // Check every file before writing any, so a damaged backup can't leave a
+        // half-restored mix or a file that breaks dictation.
+        let problems = backupProblems(bundle)
+        guard problems.isEmpty else {
+            presentError("Import failed",
+                         "Nothing was changed. This backup has data VivoType can't use:\n• "
+                         + problems.joined(separator: "\n• "))
+            return
+        }
         let alert = NSAlert()
         alert.messageText = "Replace your current settings with this backup?"
         alert.informativeText = "This overwrites \(present.count) file(s) and can't be undone."
@@ -695,4 +867,41 @@ final class SettingsController: NSObject, NSWindowDelegate {
         alert.addButton(withTitle: "OK")
         alert.runModal()
     }
+}
+
+/// A layer-backed view whose fill and border follow light / dark mode. Layer
+/// colours are CGColors frozen when assigned, so a card built once kept its
+/// first appearance (dark cards under light-mode text). This re-resolves them
+/// whenever the view's effective appearance changes, like PermissionRowView.
+private final class AppearanceLayerView: NSView {
+    private let fill: NSColor?
+    private let border: NSColor?
+
+    init(fill: NSColor?, border: NSColor? = nil) {
+        self.fill = fill
+        self.border = border
+        super.init(frame: .zero)
+        wantsLayer = true
+        applyColors()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColors()
+    }
+
+    private func applyColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            self.layer?.backgroundColor = self.fill?.cgColor
+            self.layer?.borderColor = self.border?.cgColor
+        }
+    }
+}
+
+/// A document view that lays out top-down, so a scrolled Settings window
+/// starts at the top rather than the bottom.
+private final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
 }

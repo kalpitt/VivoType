@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pill: RecordingPill?
     private var toast: Toast?
     private var dictation: Dictation?
+    private var offers: CorrectionOffers?
     private var reviewController: ReviewController?
     private var settingsController: SettingsController?
     private var settings = Settings()
@@ -49,6 +50,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isDownloadingModel = false // drives the Settings "Network activity" readout
     private var pendingCorrectionsCount = 0 // badge on the "Review corrections…" item
     private var isCountingCorrections = false // one promote.py --list-json at a time
+    private var englishWords: Set<String>? // cached /usr/share/dict/words set
+    private var modelLoadFailed = false // an `error` status since the last `ready`
 
     // Hands-free (toggle) dictation: double-tap the hotkey to start a continuous
     // recording (no holding); double-tap or tap once again to stop + insert. Hold
@@ -76,19 +79,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let modelCache = vivotypeAppSupportURL().appendingPathComponent("models")
         try? FileManager.default.createDirectory(at: modelCache, withIntermediateDirectories: true)
         setenv("HF_HOME", modelCache.path, 1)
+        // Python must never write __pycache__ next to the bundled core/ sources:
+        // any new file inside the signed .app breaks its code signature. Send all
+        // bytecode to a cache under App Support instead.
+        setenv("PYTHONPYCACHEPREFIX",
+               vivotypeAppSupportURL().appendingPathComponent("pycache").path, 1)
         setupStatusItem()
         pill = RecordingPill()
         toast = Toast()
         loadSettings()
 
-        // First-run gate: if the App Support .venv is missing, build it behind an
-        // onboarding window before starting the backend. Otherwise launch normally.
-        if FileManager.default.fileExists(atPath: vivotypeVenvPython().path) {
+        // First-run gate: launch normally only when setup_core.sh finished for
+        // this build's requirements (see SetupMarker). A venv without a matching
+        // marker (pre-marker install, interrupted setup, changed requirements) is
+        // checked off the main thread and adopted if already usable; otherwise
+        // setup runs again behind the onboarding window.
+        if SetupMarker.isCurrent() {
             finishLaunch()
         } else {
             currentStatus = "Setting up…"
             rebuildMenu()
-            beginFirstRunSetup()
+            SetupMarker.adoptExistingVenv { [weak self] usable in
+                if usable { self?.finishLaunch() } else { self?.beginFirstRunSetup() }
+            }
         }
     }
 
@@ -150,9 +163,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Retry a failed model load during onboarding: drop the dead daemon and start
     /// a fresh one (it re-downloads/loads the model).
     private func restartDaemonForOnboarding() {
+        detachAndShutdownDaemon()
+        startDaemon()
+    }
+
+    /// Stop the current daemon client without letting its dying process talk
+    /// to the UI: its EOF (up to ~2 s later) must not clobber the NEW
+    /// daemon's loading state with a stale "daemon terminated" error — in
+    /// onboarding that re-showed the failure screen mid-download.
+    private func detachAndShutdownDaemon() {
+        daemonClient?.onStatusChange = nil
+        daemonClient?.onTranscribeError = nil
+        daemonClient?.onCommand = nil
         daemonClient?.shutdown()
         daemonClient = nil
-        startDaemon()
     }
 
     /// Execute scripts/setup_core.sh from the bundle, passing the App Support dir
@@ -302,26 +326,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         rebuildMenu()
 
-        // HUD-less ("sound-only") mode suppresses the recording pill and replaces
-        // it with a start/stop cue, for users who don't want an overlay on screen.
-        // It deliberately does NOT suppress the ⚠ warning toast — that toast
+        // "Show recording indicator" controls the pill; "Start and stop sounds"
+        // the cues, independently. Hiding the pill deliberately does NOT
+        // suppress the ⚠ warning toast — that toast
         // carries information a silent failure would otherwise lose.
+        // The pill and the start/stop sounds are separate settings.
         let showHUD = settings.hudEnabled
+        let cues = settings.recordingSounds && state != previousState
         switch state {
         case .recording:
             if showHUD {
                 pill?.setMode(handsFree: isHandsFree)  // distinct badge for hands-free
                 pill?.show()
-            } else if state != previousState {
-                playHUDlessCue("Tink")
             }
+            if cues { playHUDlessCue("Tink") }
         case .transcribing:
             if showHUD {
                 pill?.setProcessing()  // stays up during the split-second of ASR
                 pill?.show()
-            } else if state != previousState {
-                playHUDlessCue("Purr")
             }
+            if cues { playHUDlessCue("Purr") }
         default:
             pill?.hide()
         }
@@ -342,12 +366,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Start/stop cue for sound-only mode — the only feedback the user gets once
-    /// the pill is hidden. Gated on the sound preference so "no pill, no sound"
-    /// stays reachable. "Pop" is reserved for the correction-captured cue
+    /// Start/stop cue ("Start and stop sounds" setting). "Pop" is reserved for
+    /// the correction-captured cue
     /// (Dictation.swift) and is deliberately not reused here.
     private func playHUDlessCue(_ name: String) {
-        guard settings.soundEnabled else { return }
         NSSound(named: name)?.play()
     }
 
@@ -548,7 +570,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         controller.onInjected = { [weak self] text in
             self?.setupController?.notePracticeTranscript(text)
+            self?.offers?.dictationLanded(text)
         }
+        let offers = CorrectionOffers(pythonPath: python, learnPath: learn, promotePath: promote)
+        offers.claimInjection = { [weak controller] text in
+            controller?.claimLastInjection(text) ?? false
+        }
+        offers.onQueueChanged = { [weak self] in self?.refreshCorrectionsCount() }
+        offers.onMessage = { [weak self] message in self?.toast?.show(message) }
+        offers.onLearned = { [weak self] in
+            if self?.settings.soundEnabled == true { NSSound(named: "Pop")?.play() }
+        }
+        offers.isCommonWord = { [weak self] word in self?.isCommonEnglishWord(word) ?? false }
+        offers.enabled = settings.suggestCorrections
+        self.offers = offers
+        if settings.suggestCorrections { preloadEnglishWords() }
         controller.soundEnabled = settings.soundEnabled
 
         // Route transcription through the daemon; fall back to one-shot CLI
@@ -562,7 +598,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let profile = self.resolvedProfile()
             if let daemon = self.daemonClient {
                 let prompt = self.buildInitialPrompt()
-                daemon.transcribe(wav: url, initialPrompt: prompt, profile: profile) { [weak self] text in
+                daemon.transcribe(wav: url, initialPrompt: prompt, profile: profile,
+                                  voiceCommands: self.settings.voiceCommands) { [weak self] text in
                     if let text = text {
                         completion(text)
                     } else {
@@ -604,11 +641,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 completion: @escaping (String?) -> Void) {
         guard let python = pythonPath, let cli = cliPath else { completion(nil); return }
         let prompt = buildInitialPrompt()
+        let voiceCommands = settings.voiceCommands
         DispatchQueue.global(qos: .userInitiated).async {
             var args = [cli, url.path]
             if !prompt.isEmpty {
                 args.append(contentsOf: ["--initial-prompt", prompt])
             }
+            if voiceCommands { args.append("--voice-commands") }
             if profile != "default", !profile.hasPrefix("-") {
                 // A hand-edited name like "--no-clean" would otherwise be
                 // eaten as a CLI flag and drop the utterance on the fallback
@@ -616,9 +655,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 args.append(contentsOf: ["--profile", profile])
             }
             let result = runProcess(python, args, timeout: 300)
-            let text = result.status == 0
-                ? result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-                : nil
+            let text = result.status == 0 ? cliTranscript(result.stdout) : nil
             DispatchQueue.main.async { completion(text) }
         }
     }
@@ -642,6 +679,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func applySettings() {
         dictation?.soundEnabled = settings.soundEnabled
+        offers?.enabled = settings.suggestCorrections
+        if settings.suggestCorrections { preloadEnglishWords() }
         // The hotkey keycode and toast flag are read live from `settings`.
     }
 
@@ -662,15 +701,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.isDownloadingModel = (downloading != nil)
                 self.currentStatus = downloading != nil ? "Downloading model…" : "Loading model…"
                 self.setState(.loading)
-            case .ready:
+            case .ready(let loadedModel):
                 self.isDaemonLoading = false
                 self.isDownloadingModel = false
                 self.lastErrorDetail = nil  // recovered — drop the stale detail
+                // Only after an error: a `ready` for an earlier load that
+                // lands while a newer switch is queued is not a failure.
+                if self.modelLoadFailed { self.adoptLoadedModel(loadedModel) }
+                self.modelLoadFailed = false
                 self.setState(.idle)
                 // Onboarding (if still showing) advances to Practice / Success
                 // only now — the menu-bar icon is live and dictation is ready.
                 self.setupController?.modelDidBecomeReady()
             case .error(let msg):
+                self.modelLoadFailed = true
                 self.isDaemonLoading = false
                 self.isDownloadingModel = false
                 warn("VivoType: daemon — \(msg). One-shot CLI fallback active.")
@@ -689,6 +733,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // already returned empty text for that request, so Dictation's normal
         // cleanup ran; this performs the actual edit in the target app.
         daemon.onCommand = { [weak self] command in
+            self?.offers?.cancel()  // the watched text is about to be deleted
             self?.dictation?.executeCommand(command)
         }
         daemonClient = daemon
@@ -696,6 +741,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         currentStatus = "Loading model…"
         setState(.loading)
         daemon.start(pythonPath: python, repoRoot: root)
+    }
+
+    /// After a failed model switch the daemon keeps serving its previous model
+    /// and reports it in `ready`. Settings must follow, or config.json keeps
+    /// naming the model that failed: the next launch retries it (offline, that
+    /// fails again) and re-picking the loaded model looked like a no-op.
+    private func adoptLoadedModel(_ loadedModel: String) {
+        guard !loadedModel.isEmpty, loadedModel != settings.model else { return }
+        let requested = ModelCatalog.label(for: settings.model)
+        settings.model = loadedModel
+        if let path = configPath { settings.save(to: path) }
+        settingsController?.reload(settings)
+        rebuildMenu()
+        toast?.show("⚠ Couldn't switch to \(requested) — kept \(ModelCatalog.label(for: loadedModel))")
     }
 
     /// Whether a learned dictionary value is safe to feed Whisper as vocabulary.
@@ -711,6 +770,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let letters = term.filter { $0.isLetter }
         if !letters.isEmpty && letters.allSatisfy({ $0.isUppercase }) { return false }
         return true
+    }
+
+    /// Load the system English word list from /usr/share/dict/words (lowercased) once per process.
+    private func loadEnglishWords() -> Set<String> {
+        if let cached = englishWords { return cached }
+        let words = Self.readEnglishWords()
+        englishWords = words
+        return words
+    }
+
+    /// Warm the word list off the main thread when the offer feature is on,
+    /// so the first card doesn't hitch the UI for the 70–90 ms read.
+    private func preloadEnglishWords() {
+        guard englishWords == nil else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let words = Self.readEnglishWords()
+            DispatchQueue.main.async {
+                if self?.englishWords == nil { self?.englishWords = words }
+            }
+        }
+    }
+
+    private static func readEnglishWords() -> Set<String> {
+        var words = Set<String>()
+        let path = "/usr/share/dict/words"
+        if let content = (try? String(contentsOfFile: path, encoding: .utf8))
+            ?? (try? String(contentsOfFile: path, encoding: .ascii)) {
+            content.enumerateLines { line, _ in
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if !trimmed.isEmpty {
+                    words.insert(trimmed)
+                }
+            }
+        }
+        return words
+    }
+
+    /// Whether a word is a common English word according to /usr/share/dict/words.
+    /// CorrectionOffers marks such a `from` word ⚠ (learning it rewrites it everywhere).
+    private func isCommonEnglishWord(_ word: String) -> Bool {
+        let normalized = word.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return loadEnglishWords().contains(normalized)
     }
 
     /// Build a comma-delimited hint string from the user's active dictionary/lexicon
@@ -730,9 +831,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let lexPath = root + "/lexicon/contacts.json"
         if let data = FileManager.default.contents(atPath: lexPath),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let names = obj["names"] as? [String] {
-            terms.append(contentsOf: names)
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let names = obj["names"] as? [String] {
+                terms.append(contentsOf: names.filter(isPromptSafeTerm))
+            }
+            if let learned = obj["learned"] as? [String] {
+                terms.append(contentsOf: learned.filter(isPromptSafeTerm))
+            }
         }
 
         var seen = Set<String>()
@@ -881,24 +986,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Per-side modifier bits (NX_DEVICE*KEYMASK in IOKit's IOLLEvent.h),
+    /// keyed by the modifier's virtual keycode.
+    private static let deviceModifierMask: [UInt16: UInt] = [
+        55: 0x0008, 54: 0x0010,  // left / right command
+        58: 0x0020, 61: 0x0040,  // left / right option
+        59: 0x0001, 62: 0x2000,  // left / right control
+        56: 0x0002, 60: 0x0004,  // left / right shift
+    ]
+
     /// Shared push-to-talk handler for both the global and local flagsChanged monitors.
     private func handleHotkey(_ event: NSEvent) {
         guard event.keyCode == self.settings.hotkeyKeycode else { return }
-        // A modifier key is "pressed" when its flag is now set, else released.
-        let flags = event.modifierFlags
+        // A modifier key is "pressed" when ITS OWN side's bit is set. The
+        // device-independent flags (.option, .command...) stay set while the
+        // other side's key is held, so releasing Right Option while holding
+        // Left Option read as a press and left the mic recording.
         let pressed: Bool
-        switch event.keyCode {
-        case 54, 55: pressed = flags.contains(.command)
-        case 58, 61: pressed = flags.contains(.option)
-        case 59, 62: pressed = flags.contains(.control)
-        case 56, 60: pressed = flags.contains(.shift)
-        default:     pressed = !flags.isEmpty
+        if let sideMask = Self.deviceModifierMask[event.keyCode] {
+            pressed = event.modifierFlags.rawValue & sideMask != 0
+        } else {
+            pressed = !event.modifierFlags.isEmpty
         }
         // Press is gated (don't start capture while paused / model loading).
         // Release is NOT — if the user paused mid-hold, we still must end the
         // capture and transcribe rather than leaving the mic stuck on.
         if pressed {
-            guard !self.isPaused, !self.isDaemonLoading else { return }
+            guard self.isHandsFree || (!self.isPaused && !self.isDaemonLoading) else { return }
             self.handleHotkeyPress()
         } else {
             self.handleHotkeyRelease()
@@ -991,14 +1105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             finishLaunch()
             return
         }
-        // Detach the old client's callbacks first: its EOF (fired when the old
-        // daemon exits, up to 2 s later) must not clobber the NEW daemon's
-        // loading state with a stale "daemon terminated" error.
-        daemonClient?.onStatusChange = nil
-        daemonClient?.onTranscribeError = nil
-        daemonClient?.onCommand = nil
-        daemonClient?.shutdown()
-        daemonClient = nil
+        detachAndShutdownDaemon()
         startDaemon()
     }
 
@@ -1017,6 +1124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard model != settings.model else { return }
         settings.model = model
         if let path = configPath { settings.save(to: path) }
+        settingsController?.reload(settings)
         if let daemon = daemonClient {
             isDaemonLoading = true
             currentStatus = "Loading model…"

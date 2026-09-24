@@ -4,7 +4,15 @@
 
 Hold a hotkey, speak, release — your words appear in whatever app you're focused on.
 
-> **Status:** Beta — feature-complete. The project was built in phases (see [`docs/phases.md`](docs/phases.md)): local ASR, Indic post-processing, the native macOS client, MLX hardware acceleration, guided permissions, and the app icon have all landed. Recent additions: per-app post-processing contexts (different rules per destination app) and bounded voice-editing commands ("scratch that", "new paragraph", "all caps that").
+> **Status:** Beta — feature-complete. The project was built in phases (see [`docs/phases.md`](docs/phases.md)): local ASR, Indic post-processing, the native macOS client, MLX hardware acceleration, guided permissions, and the app icon have all landed. Recent additions: per-app post-processing contexts (different rules per destination app) and bounded voice-editing commands ("scratch that", "new paragraph", "all caps that"), off by default (Settings → Voice commands).
+
+## What's new in v0.3.0
+
+- **Learns from your fixes** — fix a word VivoType typed and a card offers to
+  remember it (Remember / Not now, or press 1 / 2). Off by default: Settings →
+  Suggest corrections after edits.
+- **Fully offline once set up**, plus many reliability, privacy and accuracy
+  fixes — see the full list in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Why VivoType?
 

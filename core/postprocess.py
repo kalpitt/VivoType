@@ -125,18 +125,58 @@ def load_config(path=None, user_path=None):
         try:
             with overlay_path.open("r", encoding="utf-8") as fh:
                 overlay = json.load(fh)
-            for filler in overlay.get("fillers", []):
-                if filler not in fillers:
-                    fillers.append(filler)
-            replacements.update(overlay.get("replacements", {}))
         except (json.JSONDecodeError, OSError) as exc:
             _warn(f"ignoring unreadable dictionary overlay '{overlay_path}' ({exc}).")
+        else:
+            overlay_fillers, overlay_replacements = _coerce_overlay(overlay, overlay_path)
+            for filler in overlay_fillers:
+                if filler not in fillers:
+                    fillers.append(filler)
+            replacements = _merge_rules(replacements, overlay_replacements)
 
     return {
         "fillers": fillers,
         "replacements": replacements,
         "profiles": _validated_profiles(data.get("profiles") if data else None),
     }
+
+
+def _coerce_overlay(overlay, path):
+    """Return (fillers, replacements) from a parsed user dictionary, keeping
+    only well-typed entries. The overlay is written by promote.py but can be
+    hand-edited, so a wrong shape (a top-level list, replacements as a list,
+    a null value) is skipped with one warning instead of crashing boot or
+    every later cleanup."""
+    if not isinstance(overlay, dict):
+        _warn(f"ignoring malformed dictionary overlay '{path}' (not a JSON object).")
+        return [], {}
+    raw_fillers = overlay.get("fillers", [])
+    raw_replacements = overlay.get("replacements", {})
+    bad = False
+    if not isinstance(raw_fillers, list):
+        raw_fillers, bad = [], True
+    if not isinstance(raw_replacements, dict):
+        raw_replacements, bad = {}, True
+    fillers = [f for f in raw_fillers if isinstance(f, str) and f]
+    replacements = {k: v for k, v in raw_replacements.items()
+                    if isinstance(k, str) and k and isinstance(v, str)}
+    if bad or len(fillers) != len(raw_fillers) or len(replacements) != len(raw_replacements):
+        _warn(f"skipping malformed entries in dictionary overlay '{path}' "
+              "(fillers must be a list of strings, replacements an object of strings).")
+    return fillers, replacements
+
+
+def _merge_rules(base, over):
+    """Merge replacement rules so a key in `over` replaces any base key that
+    differs only in case ("Blr" overrides "blr"); matching is case-insensitive,
+    so keeping both would let the base rule silently win."""
+    merged = dict(base)
+    lowered = {k.lower() for k in over if isinstance(k, str)}
+    for key in list(merged):
+        if isinstance(key, str) and key.lower() in lowered:
+            del merged[key]
+    merged.update(over)
+    return merged
 
 
 def _validated_profiles(raw):
@@ -204,7 +244,8 @@ def resolve_profile(config, name="default"):
         return resolved
     resolved["convert_currency"] = profile.get("convert_currency", True)
     resolved["remove_fillers"] = profile.get("remove_fillers", True)
-    resolved["replacements"].update(profile.get("replacements", {}))
+    resolved["replacements"] = _merge_rules(
+        resolved["replacements"], profile.get("replacements", {}))
     return resolved
 
 
@@ -281,6 +322,7 @@ def convert_currency(text):
 # decoder-loop signature, not how people dictate. Backreference honours
 # IGNORECASE, so "Guilty guilty guilty" collapses too.
 _REPEAT_RE = re.compile(
+    r"(?<![\w%s])" % _DEVANAGARI +  # unit starts a word: "also so so" is 2 copies
     r"(\S+?(?:\s+\S+?){0,3}?)"      # the repeating unit, shortest first (lazy,
     r"(?:[\s,;:.!?।॥]+\1){2,}"      # so trailing punctuation stays a separator)
     r"(?=[\s,;:.!?।॥]|$)",          # 2+ further copies (3+ total)
@@ -304,8 +346,10 @@ def collapse_repetitions(text):
     Kills Whisper repetition loops (hallucinated "guilty guilty guilty …")
     while leaving deliberate doubles ("very very good") and digit/single-char
     runs (PINs, spelled letters) untouched. A deliberate triple ("no no no")
-    is collapsed too — the accepted cost of stopping the loops. Applied
-    repeatedly until stable so nested loops fully unwind."""
+    is collapsed too — the accepted cost of stopping the loops. A copy must
+    start a word, so "also so so" and "Goodbye bye bye" are two copies and
+    stay as dictated. Applied repeatedly until stable so nested loops fully
+    unwind."""
     while True:
         collapsed = _REPEAT_RE.sub(_collapse_unit, text)
         if collapsed == text:
@@ -313,15 +357,57 @@ def collapse_repetitions(text):
         text = collapsed
 
 
+_HESITATIONS = frozenset("um umm uh uhh uhm erm hmm mm".split())
+
+
 def remove_fillers(text, fillers):
-    """Remove whole-word filler tokens, case-insensitively."""
+    """Remove whole-word filler tokens, case-insensitively.
+
+    Two exceptions keep real words: an ALL-CAPS token is an acronym, not a
+    filler ("the ER", not "er"), and a filler joined by a hyphen is part of a
+    word ("uh-oh", "um-hmm"). Pure hesitation sounds ("UM", "UH") are never
+    acronyms, so they go in any case."""
+    fillers = [f for f in (fillers or []) if isinstance(f, str) and f]
     if not fillers:
         return text
     pattern = re.compile(
-        r"\b(?:%s)\b" % "|".join(re.escape(f) for f in fillers),
+        r"(?<![\w-])(?:%s)(?![\w-])" % "|".join(re.escape(f) for f in fillers),
         flags=re.IGNORECASE,
     )
-    return pattern.sub("", text)
+
+    def _drop(match):
+        token = match.group(0)
+        keep = (len(token) > 1 and token.isupper()
+                and token.lower() not in _HESITATIONS)
+        return token if keep else ""
+
+    return pattern.sub(_drop, text)
+
+
+# Spans a dictionary rule must not rewrite PART of: URLs, emails, code spans
+# and dotted names (files, domains). A rule whose key is the whole span
+# ("node.js") still fires. Quoted prose is deliberately NOT protected here.
+_RULE_PROTECT_PATTERNS = [
+    re.compile(r"`[^`]*`"),
+    re.compile(r"https?://\S+"),
+    re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),
+    re.compile(r"(?<![\w.-])[\w-]+(?:\.[\w-]+)+(?:/\S*)?"),  # incl. "x.com/path"
+]
+# Each pattern may only start where the previous character cannot extend it,
+# so a long run of letters is scanned once, not once per position.
+
+# "Word character" for rule boundaries: \w misses Devanagari combining marks
+# (matras, anusvara), which would let "मैं" match inside "मैंने".
+_RULE_WORD = r"\w%s" % _DEVANAGARI
+
+
+def _at_sentence_start(text, index):
+    """True at the start of the text or after a sentence mark + whitespace.
+    Walks back over whitespace only, so it costs O(gap), not O(len(text))."""
+    i = index
+    while i > 0 and text[i - 1].isspace():
+        i -= 1
+    return i == 0 or (i < index and text[i - 1] in ".!?।॥")
 
 
 def apply_replacements(text, replacements):
@@ -331,19 +417,42 @@ def apply_replacements(text, replacements):
     rule's output can never be re-matched by another rule (results don't depend on
     dict order). Longer sources are tried first, so a more specific rule wins over a
     shorter overlapping one. dst is inserted literally — a value like "\\1" or "\\g"
-    from a user dictionary must not be parsed as a regex backreference."""
+    from a user dictionary must not be parsed as a regex backreference.
+
+    Boundaries are "no word character on either side", so keys that start or
+    end with punctuation ("c++", ".net", "dr.") work. A match strictly inside a
+    URL, email, code span or dotted name is left alone. A lowercase value that
+    replaces a capitalized sentence opener is capitalized ("Gonna run" ->
+    "Going to run"); a mixed-case value ("iPhone") is kept as written."""
     by_lower = {}
     for src, dst in replacements.items():
-        if src:  # skip empty sources (an empty pattern would match everywhere)
+        # Skip empty sources (an empty pattern would match everywhere) and
+        # non-string rules from a hand-edited dictionary.
+        if isinstance(src, str) and src and isinstance(dst, str):
             by_lower.setdefault(src.lower(), dst)  # first wins on case-duplicates
     if not by_lower:
         return text
     sources = sorted(by_lower, key=len, reverse=True)
     pattern = re.compile(
-        r"\b(?:%s)\b" % "|".join(re.escape(s) for s in sources),
+        r"(?<![%s])(?:%s)(?![%s])" % (
+            _RULE_WORD, "|".join(re.escape(s) for s in sources), _RULE_WORD),
         flags=re.IGNORECASE,
     )
-    return pattern.sub(lambda m: by_lower[m.group(0).lower()], text)
+    protected = [m.span() for p in _RULE_PROTECT_PATTERNS for m in p.finditer(text)]
+
+    def _replace(match):
+        start, end = match.span()
+        if any(ps <= start and end <= pe and (ps, pe) != (start, end)
+               for ps, pe in protected):
+            return match.group(0)
+        dst = by_lower[match.group(0).lower()]
+        first_word = re.match(r"[^\W\d_]+", dst)
+        if (match.group(0)[:1].isupper() and first_word and first_word.group(0).islower()
+                and _at_sentence_start(text, start)):
+            dst = dst[0].upper() + dst[1:]
+        return dst
+
+    return pattern.sub(_replace, text)
 
 
 def _normalize_whitespace(text):
@@ -353,12 +462,24 @@ def _normalize_whitespace(text):
     # mark only. Requires whitespace between marks so a real "..." survives.
     # । (danda) and ॥ (double danda) are Devanagari sentence punctuation.
     text = re.sub(r"([,.!?;:।॥])(?:\s+[,.!?;:।॥])+", r"\1", text)
-    text = re.sub(r"\s+([,.!?;:।॥])", r"\1", text)       # no space before punctuation
+    # No space before punctuation — but only prose punctuation, i.e. a mark
+    # followed by whitespace, the end, or a closing quote/bracket. "./deploy.sh", ".env", "cd ..",
+    # ":wq" and "std::" are code and keep their spacing. Dandas are never
+    # code, so they always bind left.
+    text = re.sub(r"\s+(\.\.\.|…|[,.!?;:])(?=\s|$|[\"'”’)\]])", r"\1", text)
+    # A comma glued to the next word ("Hello ,world") is prose, never code.
+    text = re.sub(r"\s+,(?=[^\W\d_])", ", ", text)
+    text = re.sub(r"\s+([।॥])", r"\1", text)
     text = re.sub(r"।(?=[^\s।॥])", "। ", text)           # danda binds left, space follows
     text = re.sub(r"(?<=\d)\s+%", "%", text)             # "10 %" -> "10%"
     text = re.sub(r"([₹$])\s+(?=\d)", r"\1", text)       # "₹ 500" -> "₹500"
-    text = re.sub(r"([,;:])(?:\s*[,;:])+", r"\1", text)  # collapse repeated commas etc.
-    text = re.sub(r"^[\s,;:]+", "", text)                # trim leading punctuation/space
+    # Collapse repeated commas etc. Glued marks collapse only into a comma,
+    # so "std::" and "for (;;)" survive.
+    text = re.sub(r"([,;:])(?:\s+[,;:]|,)+", r"\1", text)
+    # Trim leading space and orphan ,;: marks. A leading comma always goes
+    # ("Um,okay" -> "okay"); ; and : only when followed by whitespace, so a
+    # leading ":wq" is kept.
+    text = re.sub(r"^\s*(?:(?:,|[;:](?=\s|$))\s*)+", "", text)
     # A leading filler like "Um." leaves an orphan mark ("Um. Then" → ". Then").
     # Strip a single sentence mark + following space only — not "^[.]+", which
     # would eat a genuine leading ellipsis ("... okay").

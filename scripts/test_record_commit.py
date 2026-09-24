@@ -1,223 +1,152 @@
 #!/usr/bin/env python3
-"""test_record_commit.py — self-contained tests for the ROADMAP.md guard in
-record_commit.py (2026-07-31). Plain python3, stdlib only, no pytest
-dependency (matches this repo's toolchain). Exits non-zero on any failure.
+"""test_record_commit.py — tests for record_commit.py's secret scan and the
+append-only rule for context/handoffs/. Plain python3, stdlib only, no
+network: each test builds a throwaway repo whose "origin" is a local bare
+repo, and runs the real script against it as a subprocess.
 
 Run: python3 scripts/test_record_commit.py
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
-import unittest.mock as mock
+import unittest
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(SCRIPT_DIR)
-sys.path.insert(0, SCRIPT_DIR)
-import record_commit as rc  # noqa: E402
+SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "record_commit.py")
 
-BASE = """# ROADMAP — Test
+AGENTS_MD = """# AGENTS.md (test fixture)
 
-<!-- HUMAN-OWNED. Agents: propose edits via handoff notes; never rewrite this
-file yourself. -->
-
-> **DRAFT — FOR KALPIT'S REVIEW** (drafted 2026-07-12 during the governance
-> migration; reorder/cut/rewrite freely, then delete this banner and set the
-> review date.)
-
-Last reviewed by Kalpit: <pending first review>
-
-## Now
-- Item A — done, provably (see STATE.md)
-- Item B — still active
-
-## Next
-- Item C
-
-## Later (parked)
-- Item D
-
-## Not doing (decided against — don't re-propose)
-- Item E — never, hard rule 1
-
-## Done
-- Item G — shipped, PR #9
+```record-lane
+context/STATE.md
+context/ITERATION_LOG.md
+context/handoffs/
+```
 """
 
-RESULTS = []
+HANDOFF = "context/handoffs/2026-01-01-session.md"
+HANDOFF_V1 = "# Handoff\n\n- did a thing\n- did another thing\n"
 
 
-def check(name, new_text, message, expect_allowed):
-    """Run validate_roadmap(old=BASE, new=new_text, message) in an isolated
-    temp dir, with read_ref_text patched to hand back BASE as 'origin/main'.
-    Records PASS/FAIL into RESULTS."""
-    with tempfile.TemporaryDirectory() as root:
-        path = os.path.join(root, "ROADMAP.md")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(new_text)
-        with mock.patch.object(rc, "read_ref_text", return_value=BASE):
-            allowed = True
-            err = None
-            try:
-                rc.validate_roadmap(root, "ROADMAP.md", message)
-            except SystemExit:
-                allowed = False
-            except Exception as e:  # noqa: BLE001
-                allowed = False
-                err = f"unexpected exception: {e!r}"
-    ok = (allowed == expect_allowed) and err is None
-    RESULTS.append((name, ok, allowed, expect_allowed, err))
+def git(cwd, *args):
+    return subprocess.run(["git"] + list(args), cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout
 
 
-def record(name, ok):
-    """Record a direct (non-guard) assertion into the same results table."""
-    RESULTS.append((name, bool(ok), None, None, None if ok else "assertion failed"))
+class RecordLaneRepo(unittest.TestCase):
+    """A clone of a local bare origin whose main already carries AGENTS.md,
+    context/STATE.md and one handoff."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="record-commit-test-")
+        self.origin = os.path.join(self.tmp, "origin.git")
+        self.clone = os.path.join(self.tmp, "clone")
+        git(self.tmp, "init", "-q", "--bare", "-b", "main", self.origin)
+        git(self.tmp, "clone", "-q", self.origin, self.clone)
+        for k, v in (("user.email", "t@example.com"), ("user.name", "Test"),
+                     ("commit.gpgsign", "false")):
+            git(self.clone, "config", k, v)
+        git(self.clone, "checkout", "-q", "-b", "main")
+        self.write("AGENTS.md", AGENTS_MD)
+        self.write("context/STATE.md", "# State\n\nall good\n")
+        self.write(HANDOFF, HANDOFF_V1)
+        git(self.clone, "add", "-A")
+        git(self.clone, "commit", "-qm", "init")
+        git(self.clone, "push", "-q", "origin", "main")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write(self, rel, text):
+        path = os.path.join(self.clone, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+
+    def record(self, *files):
+        return subprocess.run(
+            [sys.executable, SCRIPT, "state: test"] + list(files),
+            cwd=self.clone, capture_output=True, text=True, timeout=60)
+
+    def origin_text(self, rel):
+        return git(self.origin, "show", f"main:{rel}")
+
+    def assertBlocked(self, proc, needle):
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("BLOCKED", proc.stderr)
+        self.assertIn(needle, proc.stderr)
+
+    def assertRecorded(self, proc):
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("recorded to main", proc.stdout)
 
 
-def delete_line(text, needle):
-    return "\n".join(l for l in text.splitlines() if needle not in l) + "\n"
+class GitHubTokenPatterns(RecordLaneRepo):
+    # Synthetic, well-formed but never-issued tokens (prefix + 36 chars).
+    BODY = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+    def test_every_github_token_prefix_is_blocked(self):
+        for prefix in ("ghp_", "gho_", "ghu_", "ghs_", "ghr_"):
+            with self.subTest(prefix=prefix):
+                self.write("context/STATE.md",
+                           f"# State\n\ntoken {prefix}{self.BODY}\n")
+                self.assertBlocked(self.record("context/STATE.md"),
+                                   "GitHub token")
+        self.assertEqual(self.origin_text("context/STATE.md"),
+                         "# State\n\nall good\n")
+
+    def test_token_glued_to_a_word_is_blocked(self):
+        # "\b" fails after "_" (both word characters), so an env-style
+        # "TOKEN_ghp_..." or a trailing "_suffix" used to slip through.
+        for text in (f"TOKEN_ghp_{self.BODY}", f"ghp_{self.BODY}_old",
+                     "AWS_AKIAABCDEFGHIJKLMNOP", "KEY_sk-" + "a" * 40):
+            with self.subTest(text=text):
+                self.write("context/STATE.md", f"# State\n\n{text}\n")
+                self.assertEqual(self.record("context/STATE.md").returncode, 1)
+
+    def test_prefix_without_a_token_body_is_fine(self):
+        self.write("context/STATE.md", "# State\n\nthe gho_ prefix is OAuth\n")
+        self.assertRecorded(self.record("context/STATE.md"))
 
 
-def replace_line(text, needle, replacement):
-    return "\n".join(replacement if needle in l else l
-                      for l in text.splitlines()) + "\n"
+class HandoffsAreAppendOnly(RecordLaneRepo):
 
+    def test_append_is_recorded(self):
+        new = HANDOFF_V1 + "- and a third thing\n"
+        self.write(HANDOFF, new)
+        self.assertRecorded(self.record(HANDOFF))
+        self.assertEqual(self.origin_text(HANDOFF), new)
 
-def swap_now_lines(text):
-    lines = text.splitlines()
-    ia = next(i for i, l in enumerate(lines) if "Item A" in l)
-    ib = next(i for i, l in enumerate(lines) if "Item B" in l)
-    lines[ia], lines[ib] = lines[ib], lines[ia]
-    return "\n".join(lines) + "\n"
+    def test_truncation_is_refused(self):
+        self.write(HANDOFF, "# Handoff\n")
+        self.assertBlocked(self.record(HANDOFF), "append-only")
+        self.assertEqual(self.origin_text(HANDOFF), HANDOFF_V1)
 
+    def test_rewrite_in_the_middle_is_refused(self):
+        self.write(HANDOFF, HANDOFF_V1.replace("did a thing", "did nothing")
+                   + "- appended too\n")
+        self.assertBlocked(self.record(HANDOFF), "append-only")
+        self.assertEqual(self.origin_text(HANDOFF), HANDOFF_V1)
 
-def real_sha():
-    """A commit SHA that genuinely exists in whichever repo this runs in.
+    def test_line_ending_change_is_refused(self):
+        # Byte-for-byte: a CRLF rewrite of the old text is not an append.
+        self.write(HANDOFF, HANDOFF_V1.replace("\n", "\r\n") + "- more\r\n")
+        self.assertBlocked(self.record(HANDOFF), "append-only")
 
-    The evidence check resolves SHA-shaped tokens against real history, so this
-    test can't hardcode one — the file is byte-identical across every repo.
-    """
-    return subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
-        cwd=REPO_ROOT, text=True, capture_output=True,
-    ).stdout.strip()
+    def test_new_handoff_file_is_recorded(self):
+        rel = "context/handoffs/2026-01-02-next.md"
+        self.write(rel, "# Next\n")
+        self.assertRecorded(self.record(rel))
+        self.assertEqual(self.origin_text(rel), "# Next\n")
 
-
-def main():
-    # 1. delete one item from ## Now with a SHA in the message -> ALLOWED
-    check(
-        "delete Now item + PR-reference evidence -> ALLOWED",
-        delete_line(BASE, "Item A"),
-        "state: reconcile ROADMAP — shipped in #42",
-        expect_allowed=True,
-    )
-
-    # SHA evidence is resolved against REAL history, so it must be exercised
-    # against this actual repo — the guard tests above run in a temp dir with
-    # no git, where every SHA would fail for the wrong reason.
-    record("evidence: a real SHA from this repo -> credible",
-           rc.evidence_is_credible(f"state: done in {real_sha()}", REPO_ROOT) is True)
-    record("evidence: a fabricated SHA -> NOT credible",
-           rc.evidence_is_credible("state: done in deadbeef1", REPO_ROOT) is False)
-    record("evidence: no evidence at all -> NOT credible",
-           rc.evidence_is_credible("state: just tidying", REPO_ROOT) is False)
-
-    # 2. delete an item with NO evidence in the message -> REJECTED
-    check(
-        "delete Now item + no evidence -> REJECTED",
-        delete_line(BASE, "Item A"),
-        "state: tidy up the roadmap a bit",
-        expect_allowed=False,
-    )
-
-    # 3. adding a line to ## Next -> REJECTED
-    check(
-        "add line to Next -> REJECTED",
-        BASE.replace("## Next\n- Item C\n",
-                     "## Next\n- Item C\n- Item F — new idea\n"),
-        "state: add item — EVIDENCE: because I said so",
-        expect_allowed=False,
-    )
-
-    # 4. reordering two existing lines in ## Now -> REJECTED (subsequence)
-    check(
-        "reorder two Now lines -> REJECTED",
-        swap_now_lines(BASE),
-        "state: reorder — EVIDENCE: reprioritized",
-        expect_allowed=False,
-    )
-
-    # 5. editing a line inside ## Not doing -> REJECTED
-    check(
-        "edit line inside Not doing -> REJECTED",
-        replace_line(BASE, "Item E", "- Item E — actually reconsidering"),
-        "state: revisit — EVIDENCE: changed my mind",
-        expect_allowed=False,
-    )
-
-    # 6. deleting the DRAFT banner + setting the review date -> ALLOWED
-    banner_gone = "\n".join(
-        l for l in BASE.splitlines()
-        if not l.strip().startswith(">")
-    ) + "\n"
-    banner_gone = replace_line(
-        banner_gone, "Last reviewed by Kalpit:",
-        "Last reviewed by Kalpit: 2026-08-01"
-    )
-    check(
-        "delete DRAFT banner + set review date -> ALLOWED",
-        banner_gone,
-        "state: first review",
-        expect_allowed=True,
-    )
-
-    # 7. rewriting an existing line's text in place (same position) -> REJECTED
-    check(
-        "rewrite a Now line in place -> REJECTED",
-        replace_line(BASE, "Item B", "- Item B — completely different text"),
-        "state: reword — EVIDENCE: clarity",
-        expect_allowed=False,
-    )
-
-    # 8. deleting a line inside ## Done -> REJECTED (shipped history is
-    # byte-identical protected, same as ## Not doing)
-    check(
-        "delete line inside Done -> REJECTED",
-        delete_line(BASE, "Item G"),
-        "state: tidy up shipped history — EVIDENCE: cleanup",
-        expect_allowed=False,
-    )
-
-    # Rule 6b. Deleting a section heading is a pure, order-preserving deletion,
-    # so rules 2/3 allow it — but the EFFECT is to re-parent every item beneath
-    # it into the section above: a Class B promotion wearing Class A clothing.
-    # Must be rejected even WITH valid evidence, because no citation can make
-    # restructuring a fact.
-    check(
-        "delete a '## Next' heading (silently promotes its items to Now) -> REJECTED",
-        delete_line(BASE, "## Next"),
-        "state: tidy up the sections",
-        expect_allowed=False,
-    )
-    check(
-        "delete a '## Next' heading even WITH evidence -> still REJECTED",
-        delete_line(BASE, "## Next"),
-        "state: tidy sections — EVIDENCE: a1b2c3d",
-        expect_allowed=False,
-    )
-
-    failed = [r for r in RESULTS if not r[1]]
-    print(f"{len(RESULTS) - len(failed)}/{len(RESULTS)} passed\n")
-    for name, ok, allowed, expect, err in RESULTS:
-        status = "PASS" if ok else "FAIL"
-        detail = f" (got allowed={allowed}, expected={expect}"
-        detail += f", error={err})" if err else ")"
-        print(f"[{status}] {name}" + ("" if ok else detail))
-
-    if failed:
-        sys.exit(1)
-    print("\nAll ROADMAP guard tests passed.")
+    def test_non_handoff_record_may_still_be_rewritten(self):
+        # STATE.md is a living snapshot, not a log: unchanged behaviour.
+        self.write("context/STATE.md", "# State\n\nrewritten\n")
+        self.assertRecorded(self.record("context/STATE.md"))
+        self.assertEqual(self.origin_text("context/STATE.md"),
+                         "# State\n\nrewritten\n")
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main(verbosity=2)

@@ -31,6 +31,28 @@ class ConfigTests(unittest.TestCase):
             path.write_text("{not valid json")
             self.assertEqual(config.load_settings(path)["model"], "small.en")
 
+    def test_non_utf8_file_falls_back_to_defaults_with_warning(self):
+        # A-F9: UnicodeDecodeError escaped, so the daemon would not start.
+        import contextlib, io
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "config.json"
+            path.write_bytes(b'{"model": "tiny.en\xff\xfe"}')
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                settings = config.load_settings(path)
+        self.assertEqual(settings["model"], "small.en")
+        self.assertIn("config", err.getvalue())
+
+    def test_deeply_nested_file_falls_back_to_defaults(self):
+        # A-F9: json raises RecursionError on pathological nesting.
+        import contextlib, io
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "config.json"
+            path.write_text("[" * 200000 + "]" * 200000)
+            with contextlib.redirect_stderr(io.StringIO()):
+                settings = config.load_settings(path)
+        self.assertEqual(settings["model"], "small.en")
+
     def test_non_string_model_falls_back_to_default(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "config.json"
@@ -54,6 +76,18 @@ class ConfigTests(unittest.TestCase):
             path.write_text(json.dumps({"model": "tiny.en"}))
             self.assertTrue(config.load_settings(path)["hud_enabled"])
 
+    def test_suggest_corrections_defaults_off_and_rejects_non_bool(self):
+        # The correction offer reads the focused field: it must stay off
+        # unless the user turns it on, and a hand-edited "yes" is not on.
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "config.json"
+            path.write_text(json.dumps({"model": "tiny.en"}))
+            self.assertIs(config.load_settings(path)["suggest_corrections"], False)
+            path.write_text(json.dumps({"suggest_corrections": "yes"}))
+            self.assertIs(config.load_settings(path)["suggest_corrections"], False)
+            config.save_settings({"suggest_corrections": True}, path)
+            self.assertIs(config.load_settings(path)["suggest_corrections"], True)
+
     def test_hud_enabled_round_trip(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "config.json"
@@ -69,6 +103,15 @@ class ConfigTests(unittest.TestCase):
             path = Path(d) / "config.json"
             config.save_settings({"model": "tiny.en"}, path)
             self.assertIn("hud_enabled", json.loads(path.read_text()))
+
+    def test_voice_commands_default_off_and_round_trip(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "config.json"
+            self.assertFalse(config.load_settings(path)["voice_commands"])
+            path.write_text(json.dumps({"voice_commands": "yes"}))
+            self.assertFalse(config.load_settings(path)["voice_commands"])
+            config.save_settings({"voice_commands": True}, path)
+            self.assertTrue(config.load_settings(path)["voice_commands"])
 
     def test_non_bool_hud_enabled_falls_back_to_default(self):
         with tempfile.TemporaryDirectory() as d:

@@ -14,10 +14,14 @@ Protocol — NDJSON over stdin/stdout:
 
   Transcription request (app → daemon):
     {"id":<int>,"wav":"<path>","initial_prompt":"<str>","raw":<bool>,
-     "profile":"<name>"}          # optional; selects post-processing rules
+     "profile":"<name>",          # optional; selects post-processing rules
                                   # from postprocess_config.json 'profiles'
                                   # (per-app contexts). Missing/unknown ->
                                   # default rules.
+     "voice_commands":<bool>}     # optional; true enables spoken commands
+                                  # ("scratch that", "new line", ...).
+                                  # Missing/anything but true -> off: every
+                                  # phrase is typed as words.
 
   Transcription response (daemon → app):
     {"id":<int>,"text":"<str>","command":"scratch_that"|null}
@@ -32,6 +36,8 @@ Protocol — NDJSON over stdin/stdout:
                                         # ready. If the new model fails to load it
                                         # emits error then ready for the OLD model —
                                         # the old model stays hot, never bricking.
+                                        # A reload to the model already loaded
+                                        # (or with no model) emits just ready.
     {"cmd":"shutdown"}                  # clean exit
 
 The daemon also exits cleanly on stdin EOF (app died/crashed).
@@ -41,6 +47,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import os
 import sys
 import warnings
 from pathlib import Path
@@ -50,24 +57,45 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 try:
-    from core.audioio import has_speech, load_wav
-    from core.postprocess import config_mtime, load_config, postprocess
+    from core.audioio import EmptyAudioError, has_speech, load_wav
+    from core.postprocess import DEFAULT_CONFIG, config_mtime, load_config, postprocess
     from core.commands import apply_transform, detect_command
     from core.config import load_settings
     from core import asr
-    from core.asr import is_prompt_echo, speech_segments
+    from core.asr import compose_initial_prompt, is_prompt_echo, speech_segments
 except ImportError:
-    from audioio import has_speech, load_wav
-    from postprocess import config_mtime, load_config, postprocess
+    from audioio import EmptyAudioError, has_speech, load_wav
+    from postprocess import DEFAULT_CONFIG, config_mtime, load_config, postprocess
     from commands import apply_transform, detect_command
     from config import load_settings
     import asr
-    from asr import is_prompt_echo, speech_segments
+    from asr import compose_initial_prompt, is_prompt_echo, speech_segments
 
 
 def _emit(obj: dict) -> None:
     """Write one JSON line to stdout, flushed immediately."""
     print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
+# A path that can never exist (a child of a character device), used to load the
+# shipped post-processing rules WITHOUT the user's dictionary overlay.
+_NO_OVERLAY = Path(os.devnull) / "no-user-dictionary.json"
+
+
+def _fallback_config() -> dict:
+    """Rules to serve with when the user's config raises on load.
+
+    The shipped config without the personal overlay first; if even that
+    raises, the built-in defaults. Dictation must keep working either way.
+    """
+    try:
+        return load_config(user_path=_NO_OVERLAY)
+    except Exception:
+        return {
+            "fillers": list(DEFAULT_CONFIG["fillers"]),
+            "replacements": dict(DEFAULT_CONFIG["replacements"]),
+            "profiles": {},
+        }
 
 
 def _is_model_cached(model_name: str) -> bool:
@@ -81,10 +109,15 @@ def _load_model(model_name: str):
 
 
 def _transcribe(model, wav_path: str, initial_prompt: str, raw: bool,
-                pp_config: dict, profile: str = "default") -> dict:
+                pp_config: dict, profile: str = "default",
+                voice_commands: bool = False) -> dict:
     """Transcribe one WAV; return {"text": ...} or {"error": ...}."""
     try:
         audio = load_wav(wav_path)
+    except EmptyAudioError:
+        # A zero-frame clip is silence, not a failure: an error reply would
+        # count toward the client's hang-restart budget.
+        return {"text": "", "command": None}
     except Exception as exc:
         return {"error": f"load_wav: {exc}"}
 
@@ -94,10 +127,11 @@ def _transcribe(model, wav_path: str, initial_prompt: str, raw: bool,
     if not raw and not has_speech(audio):
         return {"text": "", "command": None}
 
+    prompt = compose_initial_prompt(initial_prompt)
     try:
         kwargs: dict = {}
-        if initial_prompt:
-            kwargs["initial_prompt"] = initial_prompt
+        if prompt:
+            kwargs["initial_prompt"] = prompt
         segments, _ = model.transcribe(audio, **kwargs)
         segs = list(segments)  # normalise to a list (mirrors the old API)
     except Exception as exc:
@@ -135,9 +169,11 @@ def _transcribe(model, wav_path: str, initial_prompt: str, raw: bool,
     # scratch returns immediately — there is nothing to clean or inject. The
     # commands module is wrapped like every other stage: a raise must never
     # kill the daemon, it just degrades to plain dictation.
+    # Voice commands are opt-in (Settings): off, every phrase is words.
     try:
-        signal, remaining, transform = detect_command(
-            text, leading_fillers=pp_config.get("fillers"))
+        signal, remaining, transform = (
+            detect_command(text, leading_fillers=pp_config.get("fillers"))
+            if voice_commands else (None, text, "none"))
     except Exception as exc:
         print(
             f"VivoType: command detection failed ({exc}); treating as dictation",
@@ -172,7 +208,7 @@ def _transcribe(model, wav_path: str, initial_prompt: str, raw: bool,
             )
     # The echo guard runs on BOTH paths — a failed cleanup must not turn into
     # a prompt-echo injection either.
-    if is_prompt_echo(text, initial_prompt):
+    if is_prompt_echo(text, prompt):
         return {"text": "", "command": None}
     return {"text": text, "command": None}
 
@@ -181,9 +217,20 @@ def main() -> None:
     try:
         settings = load_settings()
         model_name: str = settings.get("model", "small.en")
-        pp_config = load_config()
         pp_mtime = config_mtime()  # baseline for live dictionary/filler reloads
         failed_reload_mtime = None  # last mtime whose reload raised (warn-once)
+        try:
+            pp_config = load_config()
+        except Exception as exc:
+            # A wrong-typed user dictionary (e.g. {"fillers": 5}) must not stop
+            # dictation: serve the shipped rules; an edit to the file (new
+            # mtime) is retried by the request loop below.
+            failed_reload_mtime = pp_mtime
+            print(
+                f"VivoType: config load failed ({exc}); using the shipped rules.",
+                file=sys.stderr,
+            )
+            pp_config = _fallback_config()
     except Exception as exc:
         # A corrupt config.json / postprocess config must not kill the daemon
         # with a bare traceback on stderr — emit a proper NDJSON error so the
@@ -222,30 +269,58 @@ def main() -> None:
 
         if cmd.get("cmd") == "reload":
             new_model = cmd.get("model", model_name)
-            if new_model != model_name:
-                _emit({"status": "loading"})
-                # Load the new model into a temporary first; only discard the
-                # currently-working model once the swap is guaranteed to succeed.
-                # A failed reload (bad model name, download failure, OOM) must
-                # never brick the daemon — keep serving with the old model.
-                try:
-                    new = _load_model(new_model)
-                except Exception as exc:
-                    _emit({"status": "error", "error": str(exc)})
-                    _emit({"status": "ready", "model": model_name})
-                    continue
-                model = new
-                model_name = new_model
-                gc.collect()  # reclaim the now-unreferenced old model
-                asr.clear_gpu_cache()  # return its Metal buffers to the OS
-                pp_config = load_config()
-                pp_mtime = config_mtime()
+            if not isinstance(new_model, str) or not new_model:
+                _emit({"status": "error",
+                       "error": f"reload: invalid model name {new_model!r}"})
                 _emit({"status": "ready", "model": model_name})
+                continue
+            if new_model == model_name:
+                # Nothing to load, but the client flipped isReady off when it
+                # sent the reload and waits for this line.
+                _emit({"status": "ready", "model": model_name})
+                continue
+            _emit({"status": "loading"})
+            # Load the new model into a temporary first; only discard the
+            # currently-working model once the swap is guaranteed to succeed.
+            # A failed reload (bad model name, download failure, OOM) must
+            # never brick the daemon — keep serving with the old model.
+            try:
+                new = _load_model(new_model)
+            except Exception as exc:
+                _emit({"status": "error", "error": str(exc)})
+                _emit({"status": "ready", "model": model_name})
+                continue
+            model = new
+            model_name = new_model
+            gc.collect()  # reclaim the now-unreferenced old model
+            asr.clear_gpu_cache()  # return its Metal buffers to the OS
+            # Same guard as the request path: a raising config keeps the
+            # last-good rules and must not kill the daemon mid-reload.
+            current_mtime = config_mtime()
+            try:
+                pp_config = load_config()
+                pp_mtime = current_mtime
+                failed_reload_mtime = None
+            except Exception as exc:
+                if current_mtime != failed_reload_mtime:
+                    failed_reload_mtime = current_mtime
+                    print(
+                        f"VivoType: config reload failed ({exc}); keeping previous rules.",
+                        file=sys.stderr,
+                    )
+            _emit({"status": "ready", "model": model_name})
             continue
 
         req_id = cmd.get("id")
         wav = cmd.get("wav", "")
-        initial_prompt = cmd.get("initial_prompt", "") or ""
+        if not isinstance(wav, str):
+            _emit({"error": f"invalid 'wav' field: {wav!r}", "id": req_id})
+            continue
+        # A wrong-typed prompt is only a vocabulary hint: drop it (the primer
+        # still applies) rather than fail the dictation.
+        initial_prompt = cmd.get("initial_prompt", "")
+        if not isinstance(initial_prompt, str):
+            initial_prompt = ""
         raw = bool(cmd.get("raw", False))
         # A non-string profile (or an empty one) must degrade to the default
         # rules, never skip cleanup: resolve_profile would treat junk as an
@@ -253,6 +328,8 @@ def main() -> None:
         profile = cmd.get("profile", "default")
         if not isinstance(profile, str) or not profile:
             profile = "default"
+        # Strictly true: a junk value must never turn commands on.
+        voice_commands = cmd.get("voice_commands") is True
 
         # Pick up dictionary/filler/profile edits (e.g. a promoted term) without
         # a restart. A reload that RAISES (e.g. a wrong-typed field that slips
@@ -277,7 +354,15 @@ def main() -> None:
         if model is None:
             result = {"error": "ASR model is not loaded."}
         else:
-            result = _transcribe(model, wav, initial_prompt, raw, pp_config, profile)
+            # One bad request must never take the daemon (and every later
+            # dictation) down with it: an unexpected raise becomes an error
+            # reply for this id only.
+            try:
+                result = _transcribe(model, wav, initial_prompt, raw, pp_config, profile,
+                                     voice_commands)
+            except Exception as exc:
+                print(f"VivoType: request {req_id!r} failed ({exc!r})", file=sys.stderr)
+                result = {"error": f"internal: {exc}"}
         result["id"] = req_id
         _emit(result)
     # stdin EOF → clean exit (app died or sent shutdown)

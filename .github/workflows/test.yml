@@ -36,11 +36,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Two versions cover the contract: 3.9 is the minimum core/ must
-        # support (core/CLAUDE.md); 3.11 is the version the runtime venv
-        # actually uses (setup_core.sh). Linux minutes are cheap enough to
-        # gate every push.
-        python-version: ["3.9", "3.11"]
+        # 3.9 is the minimum core/ must support (core/CLAUDE.md) and the
+        # macOS system python3 the hooks and record_commit.py run under; 3.11
+        # is setup_core.sh's floor; 3.13 and 3.14 are what dev venvs actually
+        # get today (the local .venv is 3.14). Linux minutes are cheap enough
+        # to gate every push.
+        python-version: ["3.9", "3.11", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
@@ -62,6 +63,14 @@ jobs:
 
       - name: Run core tests
         run: python -m unittest discover -s core/tests -t . -v
+
+      - name: Run governance tooling tests
+        # Guard hook, record lane, publish boundary. Stdlib only; they build
+        # throwaway git repos with local bare origins, so no network.
+        run: |
+          python .claude/hooks/test_guard.py
+          python scripts/test_record_commit.py
+          python scripts/test_publish_to_public.py
 
   swift-build:
     name: macOS build (Swift)

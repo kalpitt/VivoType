@@ -23,6 +23,14 @@ SILENCE_RMS = 0.0025
 _SILENCE_WINDOW = TARGET_SR // 10  # 100 ms
 
 
+class EmptyAudioError(ValueError):
+    """The WAV holds no complete audio frame (e.g. a zero-length recording).
+
+    A ValueError so generic callers still see a read failure; the daemon and
+    CLI catch it specifically and treat the clip as silence.
+    """
+
+
 def has_speech(samples: np.ndarray, threshold: float = SILENCE_RMS,
                window: int = _SILENCE_WINDOW) -> bool:
     """Return True if any window of the clip rises above the silence floor.
@@ -47,6 +55,8 @@ def load_wav(path: Union[str, Path]) -> np.ndarray:
     """Read any WAV file; return a mono float32 array resampled to 16 kHz.
 
     Handles: 8/16/24/32-bit PCM, mono or multi-channel, any sample rate.
+    A trailing partial frame (a recording cut off mid-write) is dropped.
+    Raises EmptyAudioError when no complete frame remains.
     """
     path = Path(path)
     with wave.open(str(path), "rb") as wf:
@@ -57,8 +67,15 @@ def load_wav(path: Union[str, Path]) -> np.ndarray:
             raise ValueError(f"Malformed sample rate: {framerate}")
         nframes = wf.getnframes()
         if nframes == 0:
-            raise ValueError("Empty WAV file")
+            raise EmptyAudioError("Empty WAV file")
         raw = wf.readframes(nframes)
+
+    # The header can promise more frames than the file holds; readframes then
+    # returns what is there, which may end mid-sample or mid-frame.
+    frame_bytes = sampwidth * nchannels
+    raw = raw[:len(raw) - len(raw) % frame_bytes]
+    if not raw:
+        raise EmptyAudioError("Empty WAV file (no complete audio frame)")
 
     if sampwidth == 1:
         # WAV 8-bit is unsigned (0..255, silence=128)

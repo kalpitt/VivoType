@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from core.postprocess import (
     apply_replacements,
@@ -17,7 +18,37 @@ from core.postprocess import (
     remove_fillers,
     resolve_profile,
 )
+from core import namematch
 from core import postprocess as pp
+
+# Never read the developer's real personal data (core/data/user_dictionary.json
+# overlay, core/data/lexicon/contacts.json): point both at synthetic temp
+# files for the whole module, so results can't depend on whose checkout runs.
+_TMP = None
+_PATCHES = []
+
+
+def setUpModule():
+    global _TMP
+    _TMP = tempfile.TemporaryDirectory()
+    lexicon = Path(_TMP.name) / "contacts.json"
+    lexicon.write_text(json.dumps({"names": ["Kalpit", "Shrivastava"]}), encoding="utf-8")
+    _PATCHES[:] = [
+        mock.patch.object(pp, "USER_DICT_PATH", Path(_TMP.name) / "no-overlay.json"),
+        mock.patch.object(namematch, "LEXICON_PATH", lexicon),
+        # Force a reload now, and restore the cache afterwards so later test
+        # modules never see the synthetic names.
+        mock.patch.object(namematch, "_last_lexicon_mtime", -1),
+        mock.patch.object(namematch, "_names_by_len", None),
+    ]
+    for patcher in _PATCHES:
+        patcher.start()
+
+
+def tearDownModule():
+    for patcher in reversed(_PATCHES):
+        patcher.stop()
+    _TMP.cleanup()
 
 
 class CollapseRepetitionTests(unittest.TestCase):
@@ -165,7 +196,7 @@ class CurrencyTests(unittest.TestCase):
 
 class FillerAndDictionaryTests(unittest.TestCase):
     def setUp(self):
-        self.cfg = load_config()  # bundled defaults
+        self.cfg = load_config()  # bundled defaults (overlay patched to a temp path)
 
     def test_fillers_removed_and_blr_replaced(self):
         out = postprocess("Um, I am, uh, moving to blr next month.", self.cfg)
@@ -252,6 +283,10 @@ class FillerAndDictionaryTests(unittest.TestCase):
         out = postprocess("अच्छा। um। चलो", self.cfg)
         self.assertEqual(out, "अच्छा। चलो")
 
+    def test_spaced_danda_glued_to_next_word(self):
+        out = postprocess("नमस्ते ।फिर मिलेंगे", self.cfg)
+        self.assertEqual(out, "नमस्ते। फिर मिलेंगे")
+
     def test_space_inserted_after_danda(self):
         out = postprocess("नमस्ते।फिर मिलेंगे", self.cfg)
         self.assertEqual(out, "नमस्ते। फिर मिलेंगे")
@@ -313,7 +348,183 @@ class FillerAndDictionaryTests(unittest.TestCase):
         )
 
 
+class CodeAndPathPunctuationTests(unittest.TestCase):
+    """Spacing cleanup must only tidy prose punctuation, never code or paths."""
+
+    CFG = {"fillers": ["um"], "replacements": {},
+           "profiles": {"code": {"convert_currency": False, "remove_fillers": False}}}
+
+    CASES = {
+        "use std::vector here": "use std::vector here",
+        "run ./deploy.sh now": "run ./deploy.sh now",
+        "copy the .env file": "copy the .env file",
+        "then cd .. and build": "then cd .. and build",
+        ":wq to quit": ":wq to quit",
+        "for (;;) loop": "for (;;) loop",
+        "edit the .gitignore file": "edit the .gitignore file",
+    }
+
+    def test_code_survives_in_every_profile(self):
+        for profile in ("default", "code"):
+            for text, expected in self.CASES.items():
+                with self.subTest(profile=profile, text=text):
+                    self.assertEqual(postprocess(text, self.CFG, profile=profile), expected)
+
+    def test_prose_spacing_still_tidied(self):
+        self.assertEqual(postprocess("Hello , world .", self.CFG), "Hello, world.")
+        self.assertEqual(postprocess("I, um, went", self.CFG), "I, went")
+        self.assertEqual(postprocess("Um, then we left", self.CFG), "Then we left")
+
+
+class FillerEdgeTests(unittest.TestCase):
+    CFG = {"fillers": ["um", "uh", "er", "erm"], "replacements": {}}
+
+    def test_allcaps_token_is_not_a_filler(self):
+        self.assertEqual(postprocess("Take him to the ER now.", self.CFG),
+                         "Take him to the ER now.")
+
+    def test_hyphenated_words_never_split(self):
+        self.assertEqual(postprocess("Uh-oh, the build failed.", self.CFG),
+                         "Uh-oh, the build failed.")
+        self.assertEqual(postprocess("She said um-hmm and left.", self.CFG),
+                         "She said um-hmm and left.")
+
+    def test_ordinary_fillers_still_removed(self):
+        self.assertEqual(postprocess("Um, I er think, uh, yes", self.CFG),
+                         "I think, yes")
+
+
+class RepetitionBoundaryTests(unittest.TestCase):
+    def test_suffix_of_previous_word_is_not_a_copy(self):
+        # "also so so" is two copies of "so", not three.
+        self.assertEqual(collapse_repetitions("It was also so so."), "It was also so so.")
+        self.assertEqual(collapse_repetitions("Goodbye bye bye."), "Goodbye bye bye.")
+
+    def test_loop_after_open_paren_still_collapses(self):
+        self.assertEqual(collapse_repetitions("(guilty guilty guilty, ok"), "(guilty, ok")
+
+    def test_devanagari_suffix_is_not_a_copy(self):
+        # "ने" after the combining mark in "मैंने" is inside that word.
+        self.assertEqual(collapse_repetitions("मैंने ने ने"), "मैंने ने ने")
+
+
+class ReplacementBoundaryTests(unittest.TestCase):
+    def test_non_word_edged_keys_fire(self):
+        self.assertEqual(apply_replacements("I write c++ code", {"c++": "C++"}),
+                         "I write C++ code")
+        self.assertEqual(apply_replacements("we use .net here", {".net": ".NET"}),
+                         "we use .NET here")
+        self.assertEqual(apply_replacements("ask dr. rao", {"dr.": "Doctor"}),
+                         "ask Doctor rao")
+
+    def test_non_word_edged_keys_respect_neighbours(self):
+        self.assertEqual(apply_replacements("asp.net rocks", {".net": ".NET"}),
+                         "asp.net rocks")
+
+    def test_devanagari_key_never_matches_mid_word(self):
+        self.assertEqual(apply_replacements("मैंने कहा", {"मैं": "X"}), "मैंने कहा")
+        self.assertEqual(apply_replacements("कोई नहीं", {"को": "Y"}), "कोई नहीं")
+        self.assertEqual(apply_replacements("मैं गया", {"मैं": "X"}), "X गया")
+
+    def test_urls_emails_and_filenames_untouched(self):
+        rules = {"bangalore": "Bengaluru", "upi": "UPI", "blr": "Bengaluru"}
+        for text in ("Open https://bangalore.craigslist.org/jobs now",
+                     "see www.bangalore.example.com",
+                     "Mail me at team@upi.example.com",
+                     "Check `blr config` first",
+                     "The file is upi.json"):
+            with self.subTest(text=text):
+                self.assertEqual(apply_replacements(text, rules), text)
+
+    def test_rule_equal_to_whole_dotted_token_still_fires(self):
+        self.assertEqual(apply_replacements("use node.js", {"node.js": "Node.js"}),
+                         "use Node.js")
+
+    def test_prose_next_to_url_still_replaced(self):
+        self.assertEqual(
+            apply_replacements("blr office https://x.example/blr", {"blr": "Bengaluru"}),
+            "Bengaluru office https://x.example/blr")
+
+    def test_lowercase_replacement_capitalized_at_sentence_start(self):
+        rules = {"gonna": "going to", "iphone": "iPhone"}
+        self.assertEqual(apply_replacements("I'm late. Gonna run.", rules),
+                         "I'm late. Going to run.")
+        self.assertEqual(apply_replacements("Gonna run.", rules), "Going to run.")
+        # Mid-sentence, or a deliberately mixed-case value, stays as written.
+        self.assertEqual(apply_replacements("I'm gonna run.", rules), "I'm going to run.")
+        self.assertEqual(apply_replacements("Iphone died.", rules), "iPhone died.")
+
+
+class CaseVariantRuleTests(unittest.TestCase):
+    def setUp(self):
+        pp._WARNED_PROFILES.clear()
+
+    def test_profile_rule_differing_in_case_overrides_base(self):
+        cfg = {"fillers": [], "replacements": {"blr": "Bengaluru"},
+               "profiles": {"p": {"replacements": {"Blr": "BLR"}}}}
+        self.assertEqual(postprocess("going to blr", cfg, profile="p"), "going to BLR")
+        self.assertEqual(postprocess("going to blr", cfg), "going to Bengaluru")
+
+    def test_overlay_rule_differing_in_case_overrides_base(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / "base.json"
+            base.write_text(json.dumps({"fillers": [], "replacements": {"blr": "Bengaluru"}}))
+            overlay = Path(d) / "user.json"
+            overlay.write_text(json.dumps({"replacements": {"BLR": "Bangalore"}}))
+            cfg = load_config(base, user_path=overlay)
+        self.assertEqual(postprocess("going to blr", cfg), "going to Bangalore")
+
+
+class MalformedOverlayTests(unittest.TestCase):
+    """A valid-JSON but wrong-shaped user dictionary must be coerced or skipped
+    with a warning, never crash load_config or the cleanup that follows."""
+
+    def _load(self, body):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / "base.json"
+            base.write_text(json.dumps({"fillers": ["um"], "replacements": {"blr": "Bengaluru"}}))
+            overlay = Path(d) / "user.json"
+            overlay.write_text(body, encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                cfg = load_config(base, user_path=overlay)
+        return cfg, err.getvalue()
+
+    def test_each_wrong_shape_is_survivable(self):
+        shapes = {
+            "top-level list": "[]",
+            "replacements list": '{"replacements": ["a"]}',
+            "replacement null": '{"replacements": {"blr": null}}',
+            "replacement number": '{"replacements": {"blr": 5}}',
+            "fillers not list": '{"fillers": "um"}',
+            "filler number": '{"fillers": [5, null]}',
+        }
+        for label, body in shapes.items():
+            with self.subTest(shape=label):
+                cfg, err = self._load(body)
+                self.assertEqual(postprocess("um going to blr", cfg), "going to Bengaluru")
+                self.assertIn("overlay", err.lower())
+
+    def test_good_entries_next_to_bad_ones_are_kept(self):
+        cfg, _ = self._load('{"fillers": ["erm", 5], '
+                            '"replacements": {"kalpith": "Kalpit", "x": null}}')
+        self.assertIn("erm", cfg["fillers"])
+        self.assertEqual(cfg["replacements"]["kalpith"], "Kalpit")
+        self.assertNotIn("x", cfg["replacements"])
+
+    def test_non_string_rules_passed_directly_are_skipped(self):
+        self.assertEqual(apply_replacements("a blr", {"blr": None, "a": "A"}), "A blr")
+        self.assertEqual(remove_fillers("um hi", ["um", 5, None]), " hi")
+
+
 class LoadConfigTests(unittest.TestCase):
+    def test_module_uses_synthetic_personal_data(self):
+        # Guards the setUpModule isolation above.
+        self.assertTrue(str(pp.USER_DICT_PATH).startswith(_TMP.name))
+        self.assertTrue(str(namematch.LEXICON_PATH).startswith(_TMP.name))
+        self.assertEqual(postprocess("ask Kalpith", {"fillers": [], "replacements": {}}),
+                         "ask Kalpit")
+
     def test_defaults_present(self):
         cfg = load_config()
         self.assertIn("um", cfg["fillers"])
@@ -582,3 +793,50 @@ class ConfigMtimeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    """Regressions found in review of the code-safe cleanup (PR #52)."""
+
+    CFG = {"fillers": ["um", "uh", "er"], "replacements": {"blr": "Bengaluru", "मै": "X"}}
+
+    def test_allcaps_hesitations_are_still_fillers(self):
+        self.assertEqual(postprocess("I AM, UM, WAITING", self.CFG), "I AM, WAITING")
+        self.assertEqual(postprocess("UH, NO.", self.CFG), "NO.")
+        self.assertEqual(postprocess("Take him to the ER now.", self.CFG),
+                         "Take him to the ER now.")
+
+    def test_prose_comma_before_a_word_is_tidied(self):
+        self.assertEqual(postprocess("Hello ,world", self.CFG), "Hello, world")
+
+    def test_leading_filler_glued_to_comma(self):
+        self.assertEqual(postprocess("Um,okay go.", self.CFG), "Okay go.")
+
+    def test_space_before_mark_inside_quotes_and_parens(self):
+        self.assertEqual(postprocess('He said, "hello ."', self.CFG), 'He said, "hello."')
+        self.assertEqual(postprocess("It works (mostly .)", self.CFG), "It works (mostly.)")
+
+    def test_spaced_ellipsis_binds_left(self):
+        self.assertEqual(postprocess("Wait ... what", self.CFG), "Wait... what")
+
+    def test_rules_skip_email_www_and_devanagari_marks(self):
+        self.assertEqual(postprocess("mail blr@x.com today", self.CFG), "mail blr@x.com today")
+        self.assertEqual(postprocess("see www.x.com/blr now", self.CFG), "see www.x.com/blr now")
+        self.assertEqual(postprocess("in blr now", self.CFG), "in Bengaluru now")
+        self.assertEqual(apply_replacements("see x.com/blr now", {"blr": "Bengaluru"}),
+                         "see x.com/blr now")
+        self.assertEqual(postprocess("मैं ठीक हूँ", self.CFG), "मैं ठीक हूँ")
+
+    def test_rule_value_capitalized_only_at_sentence_start(self):
+        cfg = {"fillers": [], "replacements": {"gonna": "going to"}}
+        self.assertEqual(postprocess("Gonna run. Then Gonna rest", cfg),
+                         "Going to run. Then going to rest")
+
+    def test_long_input_stays_linear(self):
+        import time
+        cfg = {"fillers": ["um"], "replacements": {"blr": "Bengaluru"}}
+        for text in ("A" * 50000, "Gonna go. " * 8000, "a.b " * 20000):
+            with self.subTest(size=len(text)):
+                start = time.monotonic()
+                postprocess(text, cfg)
+                self.assertLess(time.monotonic() - start, 2.0)

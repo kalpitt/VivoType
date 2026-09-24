@@ -1,5 +1,5 @@
 cask "vivotype" do
-  version "0.1.0"
+  version "0.3.0"
   sha256 "PLACEHOLDER"
 
   url "https://github.com/kalpitt/VivoType/releases/download/v#{version}/VivoType-v#{version}.zip"

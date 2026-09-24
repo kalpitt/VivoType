@@ -19,19 +19,40 @@ enum VivoTypeState {
 /// model-download progress bar) can never fill a pipe and deadlock. A watchdog
 /// SIGTERMs a child that overruns `timeout`, then SIGKILLs after a short grace
 /// so a wedged MLX/native call cannot hang the app forever.
+///
+/// `input`, when given, is written to the child's stdin and then closed —
+/// the way to hand a child personal text (dictations, corrections) without
+/// putting it on argv, where `ps` and endpoint-monitoring tools can read it.
+/// Without it the child gets /dev/null, never the app's own stdin.
 func runProcess(_ executable: String, _ args: [String],
-                timeout: TimeInterval = 120) -> (stdout: String, stderr: String, status: Int32) {
+                timeout: TimeInterval = 120,
+                input: Data? = nil) -> (stdout: String, stderr: String, status: Int32) {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: executable)
     proc.arguments = args
     let outPipe = Pipe()
     let errPipe = Pipe()
+    let inPipe = input.map { _ in Pipe() }
+    proc.standardInput = inPipe ?? FileHandle.nullDevice
     proc.standardOutput = outPipe
     proc.standardError = errPipe
     do {
         try proc.run()
     } catch {
         return ("", "launch failed: \(error)", -1)
+    }
+    if let input = input, let inPipe = inPipe {
+        // Off this thread: a child that exits without reading must not block
+        // us on a full pipe; a write to a dead child throws (EPIPE) rather
+        // than raising, and the result below reports its exit status anyway.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let handle = inPipe.fileHandleForWriting
+            // A child that already exited would otherwise deliver SIGPIPE,
+            // whose default action terminates the whole app.
+            _ = fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1)
+            try? handle.write(contentsOf: input)
+            try? handle.close()
+        }
     }
 
     var outData = Data()
@@ -72,6 +93,13 @@ func runProcess(_ executable: String, _ args: [String],
     return (String(data: outData, encoding: .utf8) ?? "",
             String(data: errData, encoding: .utf8) ?? "",
             proc.terminationStatus)
+}
+
+/// A CLI transcript from stdout: drop only the one newline `print()` adds.
+/// Trimming all whitespace would erase a spoken "new line", which the core
+/// returns as the text "\n".
+func cliTranscript(_ stdout: String) -> String {
+    stdout.hasSuffix("\n") ? String(stdout.dropLast()) : stdout
 }
 
 // MARK: - locate the repo (python + CLI)

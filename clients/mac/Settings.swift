@@ -23,8 +23,8 @@ struct ModelOption {
 /// warning UI. Adding it later is one line — that's the point of this type.
 enum ModelCatalog {
     static let all: [ModelOption] = [
-        ModelOption(label: "Fast (tiny)",      id: "tiny.en"),
-        ModelOption(label: "Balanced (small)", id: "small.en"),
+        ModelOption(label: "Fastest (tiny)",        id: "tiny.en"),
+        ModelOption(label: "Most accurate (small)", id: "small.en"),
     ]
 
     /// Display label for a stored model id; falls back to the raw id so a
@@ -50,6 +50,14 @@ struct Settings {
     var toastEnabled = true
     /// False = sound-only: suppress the on-screen recording pill (not the ⚠ toast).
     var hudEnabled = true
+    /// Start/stop sounds for recording, independent of the on-screen pill.
+    var recordingSounds = false
+    /// Offer to learn an in-place edit of a dictation (✓ / Undo chip). Off by
+    /// default: it reads the focused text field through Accessibility.
+    var suggestCorrections = false
+    /// Spoken commands ("scratch that", "new line", ...). Off by default:
+    /// every phrase is typed as words.
+    var voiceCommands = false
     /// Per-app post-processing contexts: frontmost bundle ID -> profile name
     /// from postprocess_config.json's "profiles". MUST round-trip through
     /// load/save below — save() rewrites config.json wholesale, so a key it
@@ -62,11 +70,20 @@ struct Settings {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return s }
         if let v = obj["model"] as? String { s.model = v }
-        if let v = obj["hotkey_keycode"] as? Int { s.hotkeyKeycode = UInt16(v) }
+        // UInt16(exactly:), not UInt16(_:): an out-of-range value (hand edit,
+        // restored backup) trapped here on every launch — a crash loop.
+        if let v = obj["hotkey_keycode"] as? Int, let code = UInt16(exactly: v) {
+            s.hotkeyKeycode = code
+        }
         if let v = obj["hotkey_label"] as? String { s.hotkeyLabel = v }
         if let v = obj["sound_enabled"] as? Bool { s.soundEnabled = v }
         if let v = obj["toast_enabled"] as? Bool { s.toastEnabled = v }
         if let v = obj["hud_enabled"] as? Bool { s.hudEnabled = v }
+        // Before this setting existed, hiding the pill turned the sounds on:
+        // an existing "pill hidden" user keeps hearing them.
+        s.recordingSounds = obj["recording_sounds"] as? Bool ?? !s.hudEnabled
+        if let v = obj["suggest_corrections"] as? Bool { s.suggestCorrections = v }
+        if let v = obj["voice_commands"] as? Bool { s.voiceCommands = v }
         // Coerce per-entry, not with one all-or-nothing cast: a single
         // hand-edited non-string value must drop only that entry, not wipe
         // every mapping on the next save.
@@ -86,6 +103,9 @@ struct Settings {
             "sound_enabled": soundEnabled,
             "toast_enabled": toastEnabled,
             "hud_enabled": hudEnabled,
+            "recording_sounds": recordingSounds,
+            "suggest_corrections": suggestCorrections,
+            "voice_commands": voiceCommands,
             "app_profiles": appProfiles,
         ]
         if let data = try? JSONSerialization.data(withJSONObject: obj,

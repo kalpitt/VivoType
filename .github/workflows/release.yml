@@ -35,14 +35,25 @@ jobs:
           SHA=$(shasum -a 256 "VivoType-${VERSION}.zip" | awk '{print $1}')
           echo "SHA256=${SHA}" >> "$GITHUB_ENV"
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ env.ZIP_PATH }}
-          draft: false
-          prerelease: false
-          body: |
-            ## Install VivoType ${{ env.VERSION }}
+      - name: Write release notes
+        # What's new comes from this version's section of CHANGELOG.md, so the
+        # release page, the Homebrew cask's homepage and the repo stay in step.
+        run: |
+          {
+            echo "## What's new in ${VERSION}"
+            echo
+            awk -v tag="${VERSION}" '
+              index($0, "## [" tag "]") == 1 { on = 1; next }
+              on && /^## \[/ { exit }
+              on { print }
+            ' CHANGELOG.md
+            echo
+            echo "Full history: [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md)"
+            echo
+            echo "---"
+            echo
+            cat <<'INSTALL' | sed -e "s/\${VERSION}/${VERSION}/g" -e "s/\${SHA256}/${SHA256}/g"
+            ## Install VivoType ${VERSION}
 
             VivoType is a fully local macOS dictation app — everything runs on your Mac, nothing leaves your device.
 
@@ -71,7 +82,7 @@ jobs:
 
             ### Option 3 — Manual download
 
-            1. Download **VivoType-${{ env.VERSION }}.zip** below
+            1. Download **VivoType-${VERSION}.zip** below
             2. Unzip it — you'll get `VivoType.app`
             3. Drag `VivoType.app` to your **Applications** folder
             4. The first time you open it, **right-click → Open** (macOS will ask you to confirm once — this is normal for apps not sold through the App Store)
@@ -80,11 +91,25 @@ jobs:
 
             ### First launch
 
-            VivoType will guide you through a short setup on first launch. It downloads a small speech model (~150 MB) once and keeps everything on your device after that.
+            VivoType will guide you through a short setup on first launch. It downloads the speech model (about 470 MB) once and keeps everything on your device after that.
 
             ---
 
-            **SHA-256** (for the zip): `${{ env.SHA256 }}`
+            **SHA-256** (for the zip): `${SHA256}`
+          INSTALL
+          } > release-notes.md
+          # A tag with no CHANGELOG section must not ship an empty "What's new".
+          if ! grep -q "^## \[${VERSION}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section"; exit 1
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_PATH }}
+          draft: false
+          prerelease: false
+          body_path: release-notes.md
 
       - name: Update Homebrew cask
         env:

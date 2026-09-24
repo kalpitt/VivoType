@@ -1,0 +1,103 @@
+# Words the contact-name matcher (core/namematch.py) must never snap to a name.
+# /usr/share/dict/words misses informal speech, brands and Indian places, so a
+# capitalized "Gonna" or "Pune" could otherwise be "corrected" to a contact.
+# One word per line, case-insensitive. Lines starting with # are comments.
+# Keep it short and obvious: this is a guard list, not a dictionary.
+
+# informal speech
+okay
+ok
+guys
+gonna
+wanna
+gotta
+kinda
+sorta
+lemme
+gimme
+yeah
+yep
+nope
+alright
+anyways
+
+# brands and products
+gmail
+google
+whatsapp
+iphone
+ipad
+macbook
+airpods
+tesla
+netflix
+spotify
+instagram
+youtube
+linkedin
+github
+figma
+slack
+zoom
+uber
+swiggy
+zomato
+paytm
+flipkart
+
+# Indian places
+pune
+mumbai
+delhi
+bengaluru
+bangalore
+hyderabad
+chennai
+kolkata
+noida
+gurgaon
+gurugram
+kerala
+kanpur
+lucknow
+jaipur
+indore
+bhopal
+patna
+nagpur
+surat
+agra
+goa
+
+# Hinglish and food
+bhai
+yaar
+acha
+accha
+achha
+theek
+haan
+nahi
+chalo
+namaste
+paneer
+chai
+masala
+biryani
+samosa
+diwali
+khana
+nahin
+abhi
+bahut
+bilkul
+matlab
+kaam
+thik
+mausi
+masi
+chacha
+nasha
+paani
+roti
+didi

@@ -215,7 +215,9 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
     /// `pythonMissing` is the guided-install state for setup exit 42: download
     /// button + numbered steps + a background poll that continues setup
     /// automatically the moment a compatible Python appears.
-    private enum DownloadUI { case spinning, error(String), pythonMissing }
+    /// `error`'s `showSetupLog` adds where setup_core.sh's full output lives, so
+    /// a failure other than "no internet" can still be diagnosed.
+    private enum DownloadUI { case spinning, error(String, showSetupLog: Bool = false), pythonMissing }
 
     /// UserDefaults key — set after a successful practice (or skip) so a
     /// mid-setup relaunch doesn't force another rep.
@@ -784,7 +786,7 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
                 applyDownloadUI(.pythonMissing)
             } else {
                 transition(to: .downloading)
-                applyDownloadUI(.error(setupFailureMessage ?? defaultSetupError))
+                applyDownloadUI(.error(setupFailureMessage ?? defaultSetupError, showSetupLog: true))
             }
         } else {
             transition(to: .downloading)          // spinner until the script exits
@@ -919,7 +921,7 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
             applyDownloadUI(.pythonMissing)
         } else {
             if current != .downloading { transition(to: .downloading) }
-            applyDownloadUI(.error(failureMessage ?? defaultSetupError))
+            applyDownloadUI(.error(failureMessage ?? defaultSetupError, showSetupLog: true))
         }
     }
 
@@ -950,11 +952,18 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
                     "This one-time download can take a few minutes on a slow connection."
                 self?.reassuranceLabel.isHidden = false
             }
-        case .error(let message):
+        case .error(let message, let showSetupLog):
             spinner.stopAnimation(nil)
             spinner.isHidden = true
             progressLabel.textColor = .systemRed
             progressLabel.stringValue = message
+            if showSetupLog {
+                // Same file AppDelegate.runSetupScript() writes.
+                let log = vivotypeLogsURL().appendingPathComponent("setup.log").path
+                reassuranceLabel.stringValue =
+                    "Details are saved in \((log as NSString).abbreviatingWithTildeInPath)"
+                reassuranceLabel.isHidden = false
+            }
             retryButton.isHidden = false
             ActivationCoordinator.shared.refocus(window)
             announce(message)
@@ -990,6 +999,9 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
     /// and /usr/local/bin symlinks, or Homebrew's prefixes. /usr/bin/python3 is
     /// deliberately NOT probed — without the developer tools it's a stub that
     /// pops the "install command line tools" dialog, which a 3 s poll would spam.
+    /// Mirrors setup_core.sh's `is_compatible`: on Apple Silicon only a native
+    /// arm64 interpreter counts. Otherwise an Intel-only Python would "appear",
+    /// trigger Retry, get rejected by the script (exit 42), and loop every 3 s.
     private static func findCompatiblePython() -> String? {
         var candidates: [String] = []
         for minor in stride(from: 20, through: 11, by: -1) {
@@ -998,11 +1010,18 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
             candidates.append("/opt/homebrew/bin/python3.\(minor)")
         }
         candidates += ["/usr/local/bin/python3", "/opt/homebrew/bin/python3"]
+        var hasArm64: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        let requireArch = (sysctlbyname("hw.optional.arm64", &hasArm64, &size, nil, 0) == 0
+                           && hasArm64 == 1) ? "arm64" : ""
         for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: path)
             proc.arguments = ["-c",
-                "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 11) else 1)"]
+                "import platform, sys; ok = sys.version_info[:2] >= (3, 11); "
+                + "ok = ok and (not sys.argv[1] or platform.machine() == sys.argv[1]); "
+                + "raise SystemExit(0 if ok else 1)",
+                requireArch]
             proc.standardOutput = FileHandle.nullDevice
             proc.standardError = FileHandle.nullDevice
             do { try proc.run() } catch { continue }
@@ -1201,5 +1220,50 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         practiceAdvanceTimer?.invalidate()
         practiceAdvanceTimer = nil
         stopPythonPolling()
+    }
+}
+
+// MARK: - setup completion marker
+
+/// First-run gate. setup_core.sh writes `.venv/.vivotype-setup-complete` (a copy
+/// of the requirements.txt it installed) as its LAST step, and deletes it before
+/// touching packages. A venv whose marker is missing or differs from the bundled
+/// requirements.txt is not trusted: an interrupted install (quit, network drop)
+/// or an app update that changed the dependencies needs setup again.
+enum SetupMarker {
+    private static var markerURL: URL {
+        vivotypeAppSupportURL().appendingPathComponent(".venv/.vivotype-setup-complete")
+    }
+
+    /// Cheap, synchronous: the venv exists and its marker matches this build's
+    /// requirements.txt byte for byte.
+    static func isCurrent() -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: vivotypeVenvPython().path),
+              let requirements = vivotypeResourcesURL()?.appendingPathComponent("requirements.txt"),
+              let wanted = fm.contents(atPath: requirements.path),
+              let marker = fm.contents(atPath: markerURL.path)
+        else { return false }
+        return marker == wanted
+    }
+
+    /// A venv without a matching marker — typically one built before the marker
+    /// existed — is adopted rather than rebuilt when it already satisfies
+    /// requirements.txt (`setup_core.sh --check`, which writes the marker). Runs
+    /// off the main thread (it imports the ASR stack, ~1–2 s); `completion` gets
+    /// true when the venv is usable as-is, on the main queue.
+    static func adoptExistingVenv(completion: @escaping (Bool) -> Void) {
+        guard FileManager.default.fileExists(atPath: vivotypeVenvPython().path),
+              let script = vivotypeResourcesURL()?.appendingPathComponent("scripts/setup_core.sh").path
+        else { completion(false); return }
+        let appSupport = vivotypeAppSupportURL().path
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = runProcess("/bin/bash", [script, "--check", appSupport], timeout: 120)
+            if result.status != 0 {
+                warn("VivoType: existing .venv needs setup (check exit \(result.status)): "
+                     + result.stdout + result.stderr)
+            }
+            DispatchQueue.main.async { completion(result.status == 0) }
+        }
     }
 }

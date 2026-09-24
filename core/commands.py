@@ -42,6 +42,21 @@ _TRAILING_RE = re.compile(
     r"(?:^|\s)(%s)\s*[.!?,।॥]*$" % "|".join(src for src, _ in _TRAILING_PHRASES),
     re.IGNORECASE,
 )
+# A trailing phrase preceded by one of these words is ordinary content, not a
+# command: a determiner/possessive/quantifier makes it a noun phrase ("the
+# metro opened a new line", "a whole new line"), and "to" makes it an
+# infinitive ("don't forget to cap that"). Punctuation after the preceding
+# word ("I like this. New line") ends that clause, so the command still fires.
+# "that" is left out: it is far more often a pronoun or conjunction ("send
+# that new line") than a determiner. Determiners guard only the phrases that
+# can be ordinary words; "to" guards every phrase ("remember to make that a
+# bullet list").
+_CONTENT_PRECEDERS = frozenset(
+    "a an the this these those my our your his her their its whose "
+    "another every each any some no whole brand entire".split()
+)
+_GUARDED_TRANSFORMS = frozenset(("newline", "newpara", "cap"))
+
 _PHRASE_TO_TRANSFORM = {
     src.replace("\\s+", " ").replace("\\s", " "): transform
     for src, transform in _TRAILING_PHRASES
@@ -94,14 +109,23 @@ def detect_command(raw: str, leading_fillers=None):
     match = _TRAILING_RE.search(text)
     if not match:
         return None, raw, TRANSFORM_NONE
-
     phrase = re.sub(r"\s+", " ", match.group(1).lower())
-    return None, text[: match.start()].strip(), _PHRASE_TO_TRANSFORM.get(
-        phrase, TRANSFORM_NONE)
+    transform = _PHRASE_TO_TRANSFORM.get(phrase, TRANSFORM_NONE)
+    before = text[: match.start()].split()
+    prev = before[-1].lower().strip("\"'“”‘’") if before else ""
+    if prev == "to" or (transform in _GUARDED_TRANSFORMS and prev in _CONTENT_PRECEDERS):
+        return None, raw, TRANSFORM_NONE
+    return None, text[: match.start()].strip(), transform
 
 
 def apply_transform(text: str, transform: str) -> str:
     """Apply a text transform AFTER post-processing (clean casing/spacing)."""
+    # A standalone "new line" / "new paragraph" leaves no remainder but must
+    # still type the break itself.
+    if transform == "newpara":
+        return text + "\n\n"
+    if transform == "newline":
+        return text + "\n"
     if not text:
         return text
     if transform == "upper":
@@ -119,8 +143,4 @@ def apply_transform(text: str, transform: str) -> str:
         return "\n".join(
             ("- " + line if line.strip() else line) for line in text.splitlines()
         )
-    if transform == "newpara":
-        return text + "\n\n"
-    if transform == "newline":
-        return text + "\n"
     return text

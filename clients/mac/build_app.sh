@@ -3,8 +3,8 @@
 #
 # Produces clients/mac/build/VivoType.app. The bundle is fully self-contained:
 #   Contents/MacOS/VivoType           — the compiled Swift app
-#   Contents/Resources/core/       — the Python ASR backend (immutable)
-#   Contents/Resources/scripts/    — setup_core.sh etc. (immutable)
+#   Contents/Resources/core/       — the Python ASR backend (immutable, allowlisted)
+#   Contents/Resources/scripts/    — setup_core.sh only (immutable)
 #   Contents/Resources/requirements.txt — deps for first-run venv creation
 #   Contents/Resources/VERSION     — plain-text build identifier
 #
@@ -79,31 +79,51 @@ echo "==> Copying onboarding welcome logo into Resources"
 [ -f "$DIR/Assets/WelcomeLogo.png" ] && cp "$DIR/Assets/WelcomeLogo.png" "$RES/WelcomeLogo.png"
 
 # --- bundle the immutable Python source ------------------------------------
-echo "==> Copying core/ and scripts/ into Resources"
-# Exclude caches, the test suite, and PERSONAL data. Mutable per-user state
-# (corrections, dictionary, contacts, recordings) must never ship inside a
-# distributable bundle — it is created fresh in Application Support on first run
-# (see core/paths.py). Shipping it would both leak private data and write to a
-# read-only location at runtime.
-rsync -a --delete \
-  --exclude '__pycache__' \
-  --exclude '*.pyc' \
-  --exclude '.pytest_cache' \
-  --exclude 'tests' \
-  --exclude 'config.json' \
-  --exclude 'benchmark.py' \
-  --exclude 'record.py' \
-  --exclude 'data/corrections.jsonl' \
-  --exclude 'data/user_dictionary.json' \
-  --exclude 'data/lexicon' \
-  --exclude 'data/labels.csv' \
-  --exclude 'data/raw' \
-  "$REPO_ROOT/core/" "$RES/core/"
-rsync -a --delete \
-  --exclude '__pycache__' \
-  --exclude '*.pyc' \
-  "$REPO_ROOT/scripts/" "$RES/scripts/"
-cp "$REPO_ROOT/requirements.txt" "$RES/requirements.txt"
+# ALLOWLIST, not a denylist: only what the runtime opens ships in the bundle.
+# A denylist leaked whatever else sat in the working tree — personal data
+# (core/data/prompts), repo tooling (publish/record scripts, CLAUDE.md), .DS_Store
+# and stray temp files. Mutable per-user state is created fresh in Application
+# Support on first run (core/paths.py), never shipped. Adding a module to core/
+# means adding it here; the import check below fails the build if you forget.
+CORE_RUNTIME_FILES=(
+  __init__.py asr.py audioio.py cli.py commands.py config.py daemon.py
+  learn.py namematch.py paths.py postprocess.py promote.py
+  postprocess_config.json
+)
+# Data files a module reads if present (namematch falls back to no guard list
+# when it is missing), copied only when they exist in this checkout.
+CORE_OPTIONAL_FILES=(namematch_allowlist.txt)
+SCRIPTS_RUNTIME_FILES=(setup_core.sh)
+
+echo "==> Copying runtime core/ and scripts/ files into Resources"
+mkdir -p "$RES/core" "$RES/scripts"
+# -X: no extended attributes (Finder metadata would fail codesign).
+for f in "${CORE_RUNTIME_FILES[@]}"; do
+  cp -X "$REPO_ROOT/core/$f" "$RES/core/$f"
+done
+for f in "${CORE_OPTIONAL_FILES[@]}"; do
+  if [ -f "$REPO_ROOT/core/$f" ]; then cp -X "$REPO_ROOT/core/$f" "$RES/core/$f"; fi
+done
+for f in "${SCRIPTS_RUNTIME_FILES[@]}"; do
+  cp -X "$REPO_ROOT/scripts/$f" "$RES/scripts/$f"
+done
+cp -X "$REPO_ROOT/requirements.txt" "$RES/requirements.txt"
+
+# Every core module a bundled module imports (`from core.x`, `import core.x`,
+# `from core import x`) must itself be bundled, or the app dies at runtime.
+missing=""
+for mod in $(sed -nE \
+    -e 's/^[[:space:]]*from core\.([A-Za-z_][A-Za-z0-9_]*).*/\1/p' \
+    -e 's/^[[:space:]]*import core\.([A-Za-z_][A-Za-z0-9_]*).*/\1/p' \
+    -e 's/^[[:space:]]*from core import ([^#]*).*/\1/p' \
+    "$RES"/core/*.py | sed -E 's/ as [A-Za-z_][A-Za-z0-9_]*//g; s/[(),]/ /g' \
+    | tr ' ' '\n' | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | sort -u); do
+  [ -f "$RES/core/$mod.py" ] || missing="$missing $mod"
+done
+if [ -n "$missing" ]; then
+  echo "ERROR: bundled core/ imports modules missing from CORE_RUNTIME_FILES:$missing" >&2
+  exit 1
+fi
 
 # --- VERSION: exactly one source, in priority order ------------------------
 #   1. Git tag  2. short commit hash  3. 'dev'
@@ -122,9 +142,25 @@ printf '%s\n' "$VERSION" > "$RES/VERSION"
 # reset Accessibility/Mic permissions (the "permission loop"). To keep
 # permissions stable across rebuilds, create a self-signed cert once and export
 # VIVOTYPE_SIGN_ID="<cert name>" before building. No sandbox entitlement is applied.
+# A failed signature is a failed build: never report success for an unsigned
+# (or half-signed) bundle.
 SIGN_ID="${VIVOTYPE_SIGN_ID:--}"
-codesign --force --sign "$SIGN_ID" "$APP" 2>/dev/null || \
-  echo "   (codesign step skipped)"
+if [ "$SIGN_ID" = "-" ]; then
+  echo "==> Signing ad-hoc (VIVOTYPE_SIGN_ID not set: macOS permissions reset on every rebuild)"
+else
+  echo "==> Signing with identity \"$SIGN_ID\""
+fi
+if ! codesign --force --sign "$SIGN_ID" "$APP"; then
+  echo "ERROR: codesign failed with identity \"$SIGN_ID\" (see message above)." >&2
+  if [ "$SIGN_ID" != "-" ]; then
+    echo "       Check the certificate exists: security find-identity -p codesigning" >&2
+  fi
+  exit 1
+fi
+if ! codesign --verify --deep --strict "$APP"; then
+  echo "ERROR: the signed bundle does not verify (codesign --verify)." >&2
+  exit 1
+fi
 
 # --- build summary ---------------------------------------------------------
 # Determine sandbox status from the signed bundle's entitlements.
@@ -148,7 +184,11 @@ echo ""
 echo "================ Build summary ================"
 echo "  App path     : $DIR/$APP"
 echo "  Sandbox      : $(sandbox_status)"
-echo "  Signed with  : ${SIGN_ID/#-/ad-hoc}"
+if [ "$SIGN_ID" = "-" ]; then
+  echo "  Signed with  : ad-hoc (permissions will reset on rebuild)"
+else
+  echo "  Signed with  : $SIGN_ID (verified)"
+fi
 echo "  Bundled files:"
 check "core"
 check "scripts"
